@@ -159,6 +159,8 @@ def main(args: argparse.Namespace):
         return
 
     # start training
+    classifier = nn.DataParallel(classifier)
+    teacher = nn.DataParallel(teacher)
     best_acc1 = 0.
     for epoch in range(args.epochs):
         print("lr_bbone:", lr_scheduler.get_last_lr()[0])
@@ -209,7 +211,7 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
     progress = ProgressMeter(
         args.iters_per_epoch,
         [batch_time, data_time, losses, trans_losses, cls_accs, domain_accs],
-        prefix="Epoch: [{}]".format(epoch))
+        prefix="Epoch: [{}]".format(epoch+1))
 
     # switch to train mode
     model.train()
@@ -231,7 +233,7 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         ad_optimizer.zero_grad()
 
         # generate pseudo-label
-        teacher.update_weights(model, epoch * args.iters_per_epoch + i)
+        teacher.module.update_weights(model, epoch * args.iters_per_epoch + i)
         pseudo_label_t, pseudo_prob_t = teacher(x_t)
 
         # compute output
@@ -242,7 +244,7 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         cls_loss = F.cross_entropy(y_s, labels_s)
         mcc_loss_value = mcc(y_t)
         y_t_masked, _ = model(x_t_masked)
-        if teacher.pseudo_label_weight is not None:
+        if teacher.module.pseudo_label_weight is not None:
             ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
             masking_loss_value = torch.mean(pseudo_prob_t * ce)
         else:
@@ -338,10 +340,10 @@ if __name__ == '__main__':
     parser.add_argument('--trade-off', default=1., type=float,
                         help='the trade-off hyper-parameter for transfer loss')
     # training parameters
-    parser.add_argument('-b', '--batch-size', default=32, type=int,
+    parser.add_argument('-b', '--batch-size', default=16, type=int,
                         metavar='N',
                         help='mini-batch size (default: 32)')
-    parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
+    parser.add_argument('--lr', '--learning-rate', default=0.005, type=float,
                         metavar='LR', help='initial learning rate', dest='lr')
     parser.add_argument('--lr-gamma', default=0.001,
                         type=float, help='parameter for lr scheduler')
@@ -354,7 +356,7 @@ if __name__ == '__main__':
                         dest='weight_decay')
     parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
                         help='number of data loading workers (default: 2)')
-    parser.add_argument('--epochs', default=20, type=int, metavar='N',
+    parser.add_argument('--epochs', default=40, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('-i', '--iters-per-epoch', default=1000, type=int,
                         help='Number of iterations per epoch')
@@ -387,7 +389,11 @@ if __name__ == '__main__':
     parser.add_argument('--mask_blur', default=False, type=bool)
 
     args = parser.parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    # os.environ["CUDA_VISIBLE_DEVICES"] = '2'
+    # print('========',os.environ["CUDA_VISIBLE_DEVICES"],'=========')
+    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [2,3]))
+    # print(torch.cuda.device_count())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.device = device
     main(args)

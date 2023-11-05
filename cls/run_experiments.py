@@ -22,10 +22,13 @@ if __name__ == '__main__':
 
 
     cfgs = generate_experiment_cfgs(args.exp)
+    print('====================================')
+    print(cfgs)
+    print('====================================')
 
     for i, cfg in enumerate(cfgs):
         if args.machine == 'local':
             print(f'Run config {i}/{len(cfgs)}:', cfg)
-            sub_out = subprocess.run([f'cd {cfg["subfolder"]} && {cfg["EXEC_CMD"]}'], shell=True)
+            # sub_out = subprocess.run([f'cd {cfg["subfolder"]} && {cfg["EXEC_CMD"]}'], shell=True)
         else:
             raise NotImplementedError(args.machine)

@@ -83,6 +83,8 @@ def get_dataset_names():
 
 
 def get_dataset(dataset_name, root, source, target, train_source_transform, val_transform, train_target_transform=None):
+    # print('==================',dataset_name,'=================')
+    # VisDA2017
     if train_target_transform is None:
         train_target_transform = train_source_transform
     if dataset_name == "Digits":

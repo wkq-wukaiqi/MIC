@@ -94,7 +94,7 @@ def generate_experiment_cfgs(id):
     cfgs = []
     n_gpus = 1
     n_cpus = 8
-    gpu_model = 'NVIDIATITANRTX'
+    gpu_model = 'RTX 3080'
     dataset = 'VisDA2017'
     uda = 'cdan_mcc_sdat'
     architecture = 'vit_base_patch16_224'
@@ -166,7 +166,7 @@ def generate_experiment_cfgs(id):
     # SDAT with MAE on VisDA (as baseline)
     # -------------------------------------------------------------------------
     elif id == 3:
-        architecture = 'mae_base_patch16_224',  # MAE+ImageNet pretraining
+        architecture = 'mae_base_patch16_224'  # MAE+ImageNet pretraining
         datasets = [
             ('VisDA2017', 'Synthetic', 'Real'),
         ]
