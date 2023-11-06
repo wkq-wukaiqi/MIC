@@ -179,6 +179,7 @@ def main(args: argparse.Namespace):
     print("test_acc1 = {:3.1f}".format(acc1))
     if args.log_results:
         wandb.log({'epoch': epoch, 'test_acc': acc1})
+    wandb.finish()
 
     logger.close()
 

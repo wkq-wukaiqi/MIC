@@ -85,7 +85,7 @@ def main(args: argparse.Namespace):
     # create model
     print("=> using model '{}'".format(args.arch))
     backbone = utils.get_model(args.arch, pretrain=not args.scratch)
-    print(backbone)
+    # print(backbone)
     pool_layer = nn.Identity() if args.no_pool else None
     classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim,
                                  pool_layer=pool_layer, finetune=not args.scratch).to(device)
@@ -159,8 +159,8 @@ def main(args: argparse.Namespace):
         return
 
     # start training
-    classifier = nn.DataParallel(classifier)
-    teacher = nn.DataParallel(teacher)
+    # classifier = nn.DataParallel(classifier)
+    # teacher = nn.DataParallel(teacher)
     best_acc1 = 0.
     for epoch in range(args.epochs):
         print("lr_bbone:", lr_scheduler.get_last_lr()[0])
@@ -194,6 +194,7 @@ def main(args: argparse.Namespace):
     print("test_acc1 = {:3.1f}".format(acc1))
     if args.log_results:
         wandb.log({'epoch': epoch, 'test_acc': acc1})
+    wandb.finish()
 
     logger.close()
 
@@ -233,7 +234,8 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         ad_optimizer.zero_grad()
 
         # generate pseudo-label
-        teacher.module.update_weights(model, epoch * args.iters_per_epoch + i)
+        # teacher.module.update_weights(model, epoch * args.iters_per_epoch + i)
+        teacher.update_weights(model, epoch * args.iters_per_epoch + i)
         pseudo_label_t, pseudo_prob_t = teacher(x_t)
 
         # compute output
@@ -244,7 +246,8 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         cls_loss = F.cross_entropy(y_s, labels_s)
         mcc_loss_value = mcc(y_t)
         y_t_masked, _ = model(x_t_masked)
-        if teacher.module.pseudo_label_weight is not None:
+        # if teacher.module.pseudo_label_weight is not None:
+        if teacher.pseudo_label_weight is not None:
             ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
             masking_loss_value = torch.mean(pseudo_prob_t * ce)
         else:
@@ -392,7 +395,7 @@ if __name__ == '__main__':
     # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     # os.environ["CUDA_VISIBLE_DEVICES"] = '2'
     # print('========',os.environ["CUDA_VISIBLE_DEVICES"],'=========')
-    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [2,3]))
+    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [0]))
     # print(torch.cuda.device_count())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.device = device
