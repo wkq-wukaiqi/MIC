@@ -94,7 +94,7 @@ def generate_experiment_cfgs(id):
     cfgs = []
     n_gpus = 1
     n_cpus = 8
-    gpu_model = 'RTX 3080'
+    gpu_model = 'RTX 3090'
     dataset = 'VisDA2017'
     uda = 'cdan_mcc_sdat'
     architecture = 'vit_base_patch16_224'
@@ -115,18 +115,18 @@ def generate_experiment_cfgs(id):
     if id == 1:
         datasets = [
             ('VisDA2017', 'Synthetic', 'Real'),
-            ('OfficeHome', 'Ar', 'Cl'),
-            ('OfficeHome', 'Ar', 'Pr'),
-            ('OfficeHome', 'Ar', 'Rw'),
-            ('OfficeHome', 'Cl', 'Ar'),
-            ('OfficeHome', 'Cl', 'Pr'),
-            ('OfficeHome', 'Cl', 'Rw'),
-            ('OfficeHome', 'Pr', 'Ar'),
-            ('OfficeHome', 'Pr', 'Cl'),
-            ('OfficeHome', 'Pr', 'Rw'),
-            ('OfficeHome', 'Rw', 'Ar'),
-            ('OfficeHome', 'Rw', 'Cl'),
-            ('OfficeHome', 'Rw', 'Pr'),
+            # ('OfficeHome', 'Ar', 'Cl'),
+            # ('OfficeHome', 'Ar', 'Pr'),
+            # ('OfficeHome', 'Ar', 'Rw'),
+            # ('OfficeHome', 'Cl', 'Ar'),
+            # ('OfficeHome', 'Cl', 'Pr'),
+            # ('OfficeHome', 'Cl', 'Rw'),
+            # ('OfficeHome', 'Pr', 'Ar'),
+            # ('OfficeHome', 'Pr', 'Cl'),
+            # ('OfficeHome', 'Pr', 'Rw'),
+            # ('OfficeHome', 'Rw', 'Ar'),
+            # ('OfficeHome', 'Rw', 'Cl'),
+            # ('OfficeHome', 'Rw', 'Pr'),
         ]
         udas = [
             # uda method, alpha, weight, patch, ratio, aug

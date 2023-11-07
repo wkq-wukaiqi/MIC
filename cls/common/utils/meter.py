@@ -1,4 +1,5 @@
 from typing import Optional, List
+import time
 
 
 class AverageMeter(object):
@@ -82,9 +83,9 @@ class ProgressMeter(object):
         self.prefix = prefix
 
     def display(self, batch):
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries = [time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time())),self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
+        print(' '.join(entries))
 
     def _get_batch_fmtstr(self, num_batches):
         num_digits = len(str(num_batches // 1))
