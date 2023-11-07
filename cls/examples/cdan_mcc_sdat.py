@@ -16,6 +16,7 @@ from torch.optim import SGD
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from torch.cuda.amp import autocast,GradScaler
 
 sys.path.append('../')
 from dalib.modules.domain_discriminator import DomainDiscriminator
@@ -73,9 +74,9 @@ def main(args: argparse.Namespace):
     train_target_loader = DataLoader(train_target_dataset, batch_size=args.batch_size,
                                      shuffle=True, num_workers=args.workers, drop_last=True)
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+        val_dataset, batch_size=args.batch_size*4, shuffle=False, num_workers=args.workers)
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+        test_dataset, batch_size=args.batch_size*4, shuffle=False, num_workers=args.workers)
 
     train_source_iter = ForeverDataIterator(train_source_loader)
     train_target_iter = ForeverDataIterator(train_target_loader)
@@ -148,6 +149,8 @@ def main(args: argparse.Namespace):
 
     # start training
     best_acc1 = 0.
+    first_step_scaler=GradScaler()
+    second_step_scaler=GradScaler()
     for epoch in range(args.epochs):
         print("lr_bbone:", lr_scheduler.get_last_lr()[0])
         print("lr_btlnck:", lr_scheduler.get_last_lr()[1])
@@ -156,7 +159,7 @@ def main(args: argparse.Namespace):
                        "lr_btlnck": lr_scheduler.get_last_lr()[1]})
         # train for one epoch
 
-        train(train_source_iter, train_target_iter, classifier, domain_adv, mcc_loss, optimizer, ad_optimizer,
+        train(first_step_scaler, second_step_scaler, train_source_iter, train_target_iter, classifier, domain_adv, mcc_loss, optimizer, ad_optimizer,
               lr_scheduler, lr_scheduler_ad, epoch, args)
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
@@ -184,7 +187,7 @@ def main(args: argparse.Namespace):
     logger.close()
 
 
-def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator, model: ImageClassifier,
+def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator, model: ImageClassifier,
           domain_adv: ConditionalDomainAdversarialLoss, mcc, optimizer, ad_optimizer,
           lr_scheduler: LambdaLR, lr_scheduler_ad, epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':3.1f')
@@ -217,28 +220,45 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         ad_optimizer.zero_grad()
 
         # compute output
-        x = torch.cat((x_s, x_t), dim=0)
-        y, f = model(x)
-        y_s, y_t = y.chunk(2, dim=0)
-        f_s, f_t = f.chunk(2, dim=0)
-        cls_loss = F.cross_entropy(y_s, labels_s)
-        mcc_loss_value = mcc(y_t)
-        loss = cls_loss + mcc_loss_value
+        with autocast():
+            x = torch.cat((x_s, x_t), dim=0)
+            y, f = model(x)
+            y_s, y_t = y.chunk(2, dim=0)
+            f_s, f_t = f.chunk(2, dim=0)
+            cls_loss = F.cross_entropy(y_s, labels_s)
+            mcc_loss_value = mcc(y_t)
+            loss = cls_loss + mcc_loss_value
 
-        loss.backward()
+        first_step_scaler.scale(loss).backward()
+        first_step_scaler.unscale_(optimizer)
 
-        # Calculate ϵ̂ (w) and add it to the weights
-        optimizer.first_step(zero_grad=True)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
+
+        optimizer_state = first_step_scaler._per_optimizer_states[id(optimizer)]
+
+        # Check if any gradients are inf/nan
+        inf_grad_cnt = sum(v.item() for v in optimizer_state["found_inf_per_device"].values())
+
+        if inf_grad_cnt == 0:
+            # if valid graident, apply sam_first_step
+            optimizer.first_step(zero_grad=True)
+            sam_first_step_applied = True
+        else:
+            # if invalid graident, skip sam and revert to single optimization step
+            optimizer.zero_grad()
+            sam_first_step_applied = False
+        first_step_scaler.update()
 
         # Calculate task loss and domain loss
-        y, f = model(x)
-        y_s, y_t = y.chunk(2, dim=0)
-        f_s, f_t = f.chunk(2, dim=0)
+        with autocast():
+            y, f = model(x)
+            y_s, y_t = y.chunk(2, dim=0)
+            f_s, f_t = f.chunk(2, dim=0)
 
-        cls_loss = F.cross_entropy(y_s, labels_s)
-        transfer_loss = domain_adv(y_s, f_s, y_t, f_t) + mcc(y_t)
-        domain_acc = domain_adv.domain_discriminator_accuracy
-        loss = cls_loss + transfer_loss * args.trade_off
+            cls_loss = F.cross_entropy(y_s, labels_s)
+            transfer_loss = domain_adv(y_s, f_s, y_t, f_t) + mcc(y_t)
+            domain_acc = domain_adv.domain_discriminator_accuracy
+            loss = cls_loss + transfer_loss * args.trade_off
 
         cls_acc = accuracy(y_s, labels_s)[0]
         if args.log_results:
@@ -250,11 +270,15 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         domain_accs.update(domain_acc, x_s.size(0))
         trans_losses.update(transfer_loss.item(), x_s.size(0))
 
-        loss.backward()
-        # Update parameters of domain classifier
-        ad_optimizer.step()
-        # Update parameters (Sharpness-Aware update)
-        optimizer.second_step(zero_grad=True)
+        second_step_scaler.scale(loss).backward()
+        second_step_scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
+        if sam_first_step_applied:
+            optimizer.second_step()
+        second_step_scaler.step(optimizer)
+        second_step_scaler.step(ad_optimizer)
+        second_step_scaler.update()
+
         lr_scheduler.step()
         lr_scheduler_ad.step()
 

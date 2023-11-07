@@ -88,9 +88,9 @@ class ConditionalDomainAdversarialLoss(nn.Module):
         else:
             self.map = MultiLinearMap()
 
-        self.bce = lambda input, target, weight: F.binary_cross_entropy(input, target, weight,
+        self.bce = lambda input, target, weight: F.binary_cross_entropy_with_logits(input, target, weight,
                                                                         reduction=reduction) if self.entropy_conditioning \
-            else F.binary_cross_entropy(input, target, reduction=reduction)
+            else F.binary_cross_entropy_with_logits(input, target, reduction=reduction)
         self.domain_discriminator_accuracy = None
 
     def forward(self, g_s: torch.Tensor, f_s: torch.Tensor, g_t: torch.Tensor, f_t: torch.Tensor) -> torch.Tensor:
@@ -106,7 +106,7 @@ class ConditionalDomainAdversarialLoss(nn.Module):
         weight = 1.0 + torch.exp(-entropy(g))
         batch_size = f.size(0)
         weight = weight / torch.sum(weight) * batch_size
-        self.domain_discriminator_accuracy = binary_accuracy(d, d_label)
+        self.domain_discriminator_accuracy = binary_accuracy(F.sigmoid(d), d_label)
         return self.bce(d, d_label, weight.view_as(d))
 
 
