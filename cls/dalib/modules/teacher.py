@@ -67,4 +67,4 @@ class EMATeacher(nn.Module):
         else:
             raise NotImplementedError(self.pseudo_label_weight)
 
-        return pseudo_label, pseudo_weight
+        return pseudo_label, pseudo_weight, ema_softmax

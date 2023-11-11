@@ -119,7 +119,6 @@ def main(args: argparse.Namespace):
 
     mcc_loss = MinimumClassConfusionLoss(temperature=args.temperature)
 
-    teacher = EMATeacher(classifier, alpha=args.alpha, pseudo_label_weight=args.pseudo_label_weight).to(device)
     masking = Masking(
         block_size=args.mask_block_size,
         ratio=args.mask_ratio,
@@ -165,6 +164,7 @@ def main(args: argparse.Namespace):
     best_acc1 = 0.
     first_step_scaler=GradScaler()
     second_step_scaler=GradScaler()
+    teacher = None
     for epoch in range(args.epochs):
         print("lr_bbone:", lr_scheduler.get_last_lr()[0])
         print("lr_btlnck:", lr_scheduler.get_last_lr()[1])
@@ -172,6 +172,11 @@ def main(args: argparse.Namespace):
             wandb.log({"lr_bbone": lr_scheduler.get_last_lr()[0],
                        "lr_btlnck": lr_scheduler.get_last_lr()[1]})
         # train for one epoch
+
+        if teacher is None and (epoch + 1) >= args.teacher_epoch:
+            print(f'Epoch {epoch + 1} add teacher')
+            classifier.train()
+            teacher = EMATeacher(classifier, alpha=args.alpha, pseudo_label_weight=args.pseudo_label_weight).to(device)
 
         train(first_step_scaler, second_step_scaler, train_source_iter, train_target_iter, classifier, teacher,
               domain_adv, mcc_loss, masking, optimizer, ad_optimizer,
@@ -212,9 +217,10 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
     trans_losses = AverageMeter('Trans Loss', ':3.2f')
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
     domain_accs = AverageMeter('Domain Acc', ':3.1f')
+    pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
     progress = ProgressMeter(
         args.iters_per_epoch,
-        [batch_time, data_time, losses, trans_losses, cls_accs, domain_accs],
+        [batch_time, data_time, losses, trans_losses, cls_accs, domain_accs, pseudo_label_accs],
         prefix="Epoch: [{}]".format(epoch+1))
 
     # switch to train mode
@@ -224,13 +230,16 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
     end = time.time()
     for i in range(args.iters_per_epoch):
         x_s, labels_s = next(train_source_iter)
-        x_t, _ = next(train_target_iter)
+        # labels_t仅用于研究伪标签准确率
+        x_t, labels_t = next(train_target_iter)
 
         x_s = x_s.to(device)
         x_t = x_t.to(device)
         # 生成target的mask
         x_t_masked = masking(x_t)
         labels_s = labels_s.to(device)
+
+        labels_t = labels_t.to(device)
 
         # measure data loading time
         data_time.update(time.time() - end)
@@ -239,8 +248,12 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
 
         # generate pseudo-label
         # teacher.module.update_weights(model, epoch * args.iters_per_epoch + i)
-        teacher.update_weights(model, epoch * args.iters_per_epoch + i)
-        pseudo_label_t, pseudo_prob_t = teacher(x_t)
+        if (epoch + 1) >= args.teacher_epoch:
+            teacher.update_weights(model, epoch * args.iters_per_epoch + i)
+            pseudo_label_t, pseudo_prob_t, ema_softmax  = teacher(x_t)
+            pseudo_label_acc, = accuracy(ema_softmax, labels_t, topk=(1,))
+        else:
+            pseudo_label_acc = 0.
 
         # compute output
         with autocast():
@@ -253,18 +266,23 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             # SDAT论文里的MinimumClassConfusionLoss，直接用
             mcc_loss_value = mcc(y_t)
             # mask数据的预测
-            y_t_masked, _ = model(x_t_masked)
+            # y_t_masked, _ = model(x_t_masked)
             # if teacher.module.pseudo_label_weight is not None:
             # 用mask的预测结果和伪标签计算CE
             # masking_loss_value就是所谓的 MIC loss
-            if teacher.pseudo_label_weight is not None:
-                ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
-                masking_loss_value = torch.mean(pseudo_prob_t * ce)
+            if (epoch + 1) >= args.teacher_epoch:
+                # 5轮后才加入teacher
+                y_t_masked, _ = model(x_t_masked)
+                if teacher.pseudo_label_weight is not None:
+                    ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
+                    masking_loss_value = torch.mean(pseudo_prob_t * ce)
+                else:
+                    masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+                # 损失由源域数据分类损失、MCC损失、目标域mask后的分类损失（MIC loss）组成
+                # 相当于是源域和目标域一起训练
+                loss = cls_loss + mcc_loss_value + masking_loss_value
             else:
-                masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
-            # 损失由源域数据分类损失、MCC损失、目标域mask后的分类损失（MIC loss）组成
-            # 相当于是源域和目标域一起训练
-            loss = cls_loss + mcc_loss_value + masking_loss_value
+                loss = cls_loss + mcc_loss_value
 
         first_step_scaler.scale(loss).backward()
         first_step_scaler.unscale_(optimizer)
@@ -293,9 +311,13 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             f_s, f_t = f.chunk(2, dim=0)
 
             cls_loss = F.cross_entropy(y_s, labels_s)
-            y_t_masked, _ = model(x_t_masked)
-            transfer_loss = domain_adv(y_s, f_s, y_t, f_t) + mcc(y_t) + \
+            # y_t_masked, _ = model(x_t_masked)
+            if epoch > 4:
+                y_t_masked, _ = model(x_t_masked)
+                transfer_loss = domain_adv(y_s, f_s, y_t, f_t) + mcc(y_t) + \
                             F.cross_entropy(y_t_masked, pseudo_label_t)
+            else:
+                transfer_loss = domain_adv(y_s, f_s, y_t, f_t) + mcc(y_t)
             domain_acc = domain_adv.domain_discriminator_accuracy
             # 来自SDAT的步骤，最终的损失除了上面的源域数据分类损失、MCC损失、MIC loss
             # 还有一个ConditionalDomainAdversarialLoss，即CDAN，这也是SDAT的一个组成部分
@@ -315,6 +337,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
         cls_accs.update(cls_acc, x_s.size(0))
         domain_accs.update(domain_acc, x_s.size(0))
         trans_losses.update(transfer_loss.item(), x_s.size(0))
+        pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
 
         second_step_scaler.scale(loss).backward()
         second_step_scaler.unscale_(optimizer)
@@ -411,7 +434,7 @@ if __name__ == '__main__':
                              "When phase is 'analysis', only analysis the model.")
     parser.add_argument('--log_results', action='store_true',
                         help="To log results in wandb")
-    parser.add_argument('--gpu', type=str, default="0", help="GPU ID")
+    parser.add_argument('--gpu', type=int, default=0, help="GPU ID")# 仅单卡
     parser.add_argument('--log_name', type=str,
                         default="log", help="log name for wandb")
     parser.add_argument('--rho', type=float, default=0.05, help="GPU ID")
@@ -426,12 +449,11 @@ if __name__ == '__main__':
     parser.add_argument('--mask_color_jitter_p', default=0, type=float)
     parser.add_argument('--mask_blur', default=False, type=bool)
 
+    # 开始加入teacher监督的轮次
+    parser.add_argument('--teacher_epoch', default=1, type=int)
+
     args = parser.parse_args()
-    # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    # os.environ["CUDA_VISIBLE_DEVICES"] = '2'
-    # print('========',os.environ["CUDA_VISIBLE_DEVICES"],'=========')
-    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [0]))
-    # print(torch.cuda.device_count())
+    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [args.gpu]))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.device = device
     main(args)
