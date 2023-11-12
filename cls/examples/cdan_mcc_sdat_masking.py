@@ -197,12 +197,14 @@ def main(args: argparse.Namespace):
     print("best_acc1 = {:3.1f}".format(best_acc1))
 
     # evaluate on test set
-    classifier.load_state_dict(torch.load(logger.get_checkpoint_path('best')))
-    acc1 = utils.validate(test_loader, classifier, args, device)
-    print("test_acc1 = {:3.1f}".format(acc1))
+    # classifier.load_state_dict(torch.load(logger.get_checkpoint_path('best')))
+    # acc1 = utils.validate(test_loader, classifier, args, device)
+    # print("test_acc1 = {:3.1f}".format(acc1))
+    # if args.log_results:
+    #     wandb.log({'epoch': epoch, 'test_acc': acc1})
+
     if args.log_results:
-        wandb.log({'epoch': epoch, 'test_acc': acc1})
-    wandb.finish()
+        wandb.finish()
 
     logger.close()
 
@@ -248,12 +250,10 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
 
         # generate pseudo-label
         # teacher.module.update_weights(model, epoch * args.iters_per_epoch + i)
-        if (epoch + 1) >= args.teacher_epoch:
+        if teacher is not None:
             teacher.update_weights(model, epoch * args.iters_per_epoch + i)
             pseudo_label_t, pseudo_prob_t, ema_softmax  = teacher(x_t)
             pseudo_label_acc, = accuracy(ema_softmax, labels_t, topk=(1,))
-        else:
-            pseudo_label_acc = 0.
 
         # compute output
         with autocast():
@@ -270,7 +270,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             # if teacher.module.pseudo_label_weight is not None:
             # 用mask的预测结果和伪标签计算CE
             # masking_loss_value就是所谓的 MIC loss
-            if (epoch + 1) >= args.teacher_epoch:
+            if teacher is not None:
                 # 5轮后才加入teacher
                 y_t_masked, _ = model(x_t_masked)
                 if teacher.pseudo_label_weight is not None:
@@ -312,7 +312,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
 
             cls_loss = F.cross_entropy(y_s, labels_s)
             # y_t_masked, _ = model(x_t_masked)
-            if epoch > 4:
+            if teacher is not None:
                 y_t_masked, _ = model(x_t_masked)
                 transfer_loss = domain_adv(y_s, f_s, y_t, f_t) + mcc(y_t) + \
                             F.cross_entropy(y_t_masked, pseudo_label_t)
@@ -337,7 +337,8 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
         cls_accs.update(cls_acc, x_s.size(0))
         domain_accs.update(domain_acc, x_s.size(0))
         trans_losses.update(transfer_loss.item(), x_s.size(0))
-        pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
+        if teacher is not None:
+            pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
 
         second_step_scaler.scale(loss).backward()
         second_step_scaler.unscale_(optimizer)
