@@ -34,13 +34,13 @@ def resize(input,
 
 def strong_transform(param, data):
     data = color_jitter(
-        color_jitter=param['color_jitter'],
         s=param['color_jitter_s'],
         p=param['color_jitter_p'],
         mean=param['mean'],
         std=param['std'],
         data=data)
-    data = gaussian_blur(blur=param['blur'], data=data)
+    if param['blur'] == 1:
+        data = gaussian_blur(data)
     return data
 
 
@@ -52,9 +52,10 @@ def renorm(img, mean, std):
     return img.sub(mean).div(std)
 
 
-def color_jitter(color_jitter, mean, std, data, s=.25, p=.2):
+def color_jitter(mean, std, data, s=.25, p=.2):
     # s is the strength of colorjitter
-    if color_jitter > p:
+    color_jitter = random.uniform(0, 1)
+    if color_jitter > (1-p):
         mean = torch.as_tensor(mean, device=data.device)
         mean = repeat(mean, 'C -> B C 1 1', B=data.shape[0], C=3)
         std = torch.as_tensor(std, device=data.device)
@@ -71,23 +72,59 @@ def color_jitter(color_jitter, mean, std, data, s=.25, p=.2):
     return data
 
 
-def gaussian_blur(blur, data):
-    if blur > 0.5:
-        sigma = np.random.uniform(0.15, 1.15)
-        kernel_size_y = int(
-            np.floor(
-                np.ceil(0.1 * data.shape[2]) - 0.5 +
-                np.ceil(0.1 * data.shape[2]) % 2))
-        kernel_size_x = int(
-            np.floor(
-                np.ceil(0.1 * data.shape[3]) - 0.5 +
-                np.ceil(0.1 * data.shape[3]) % 2))
-        kernel_size = (kernel_size_y, kernel_size_x)
-        seq = nn.Sequential(
-            kornia.filters.GaussianBlur2d(
-                kernel_size=kernel_size, sigma=(sigma, sigma)))
-        data = seq(data)
+def gaussian_blur(data):
+    sigma = np.random.uniform(0.15, 1.15)
+    kernel_size_y = int(
+        np.floor(
+            np.ceil(0.1 * data.shape[2]) - 0.5 +
+            np.ceil(0.1 * data.shape[2]) % 2))
+    kernel_size_x = int(
+        np.floor(
+            np.ceil(0.1 * data.shape[3]) - 0.5 +
+            np.ceil(0.1 * data.shape[3]) % 2))
+    kernel_size = (kernel_size_y, kernel_size_x)
+    seq = nn.Sequential(
+        kornia.filters.GaussianBlur2d(
+            kernel_size=kernel_size, sigma=(sigma, sigma)))
+    data = seq(data)
     return data
+
+class StrongAugmentation(object):
+    """
+    强数据增强, 和mask保持一致
+    """
+
+    def __init__(self, color_jitter_s, color_jitter_p, blur, mean, std):
+        super().__init__()
+        if color_jitter_p > 0:
+            print('[Masking] Use color augmentation.')
+        self.augmentation_params = {
+            # 'color_jitter': random.uniform(0, 1),
+            'color_jitter_s': color_jitter_s,
+            'color_jitter_p': color_jitter_p,
+            # 'blur': random.uniform(0, 1) if blur else 0,
+            'blur': 1 if blur else 0,
+            'mean': mean,
+            'std': std
+        }
+
+    def __call__(self, img):
+        with_batch = True
+        if len(img.shape) == 3:
+            img = img.clone().unsqueeze(0)
+            with_batch = False
+        if self.augmentation_params is not None:
+            # strong_transform是按batch操作，而transform是按单个图像操作，维度要变一下
+            img = strong_transform(self.augmentation_params, data=img.clone())
+        if not with_batch:
+            img = img[0]
+        return img
+
+    def __repr__(self):
+        format_string = self.__class__.__name__ + '('
+        format_string += '\n    {}'.format(self.augmentation_params)
+        format_string += '\n)'
+        return format_string
 
 class Masking(nn.Module):
     def __init__(self, block_size, ratio, color_jitter_s, color_jitter_p, blur, mean, std):
@@ -96,25 +133,14 @@ class Masking(nn.Module):
         self.block_size = block_size
         self.ratio = ratio
 
-        self.augmentation_params = None
-        if (color_jitter_p > 0 and color_jitter_s > 0) or blur:
-            print('[Masking] Use color augmentation.')
-            self.augmentation_params = {
-                'color_jitter': random.uniform(0, 1),
-                'color_jitter_s': color_jitter_s,
-                'color_jitter_p': color_jitter_p,
-                'blur': random.uniform(0, 1) if blur else 0,
-                'mean': mean,
-                'std': std
-            }
+        self.strong_transform = StrongAugmentation(color_jitter_s, color_jitter_p, blur, mean, std)
 
     @torch.no_grad()
     def forward(self, img: Tensor):
         img = img.clone()
         B, _, H, W = img.shape
 
-        if self.augmentation_params is not None:
-            img = strong_transform(self.augmentation_params, data=img.clone())
+        img = self.strong_transform(img.clone())
 
         mshape = B, 1, round(H / self.block_size), round(W / self.block_size)
         input_mask = torch.rand(mshape, device=img.device)
@@ -123,3 +149,6 @@ class Masking(nn.Module):
         masked_img = img * input_mask
 
         return masked_img
+    
+    def update_ratio(self, new_ratio):
+        self.ratio = new_ratio

@@ -3,6 +3,7 @@ import os.path as osp
 import time
 from copy import deepcopy
 from functools import partial
+import random
 
 import timm
 import torch
@@ -15,6 +16,7 @@ import wandb
 import wilds
 
 from dalib.modules.mae import create_mae
+from dalib.modules.masking import StrongAugmentation
 
 sys.path.append('../')
 import common.vision.datasets as datasets
@@ -169,9 +171,9 @@ def validate(val_loader, model, args, device) -> float:
 
     return top1.avg
 
-
-def get_train_transform(resizing='default', random_horizontal_flip=True, random_color_jitter=False,
-                        resize_size=224, norm_mean=(0.485, 0.456, 0.406), norm_std=(0.229, 0.224, 0.225)):
+def get_train_transform(resizing='default', random_horizontal_flip=True, random_color_jitter=False, strong_aug=False,
+                        color_jitter_s=0.2, color_jitter_p=0.2, blur=False, resize_size=224,
+                        norm_mean=(0.485, 0.456, 0.406), norm_std=(0.229, 0.224, 0.225)):
     """
     resizing mode:
         - default: resize the image to 256 and take a random resized crop of size 224;
@@ -202,6 +204,44 @@ def get_train_transform(resizing='default', random_horizontal_flip=True, random_
         transforms.append(T.RandomHorizontalFlip())
     if random_color_jitter:
         transforms.append(T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5))
+    transforms.extend([
+        T.ToTensor(),
+        T.Normalize(mean=norm_mean, std=norm_std)
+    ])
+    if strong_aug:
+        transforms.append(StrongAugmentation(color_jitter_s, color_jitter_p, blur, norm_mean, norm_std))
+    return T.Compose(transforms)
+
+def get_train_target_transform(resizing='default', random_horizontal_flip=True, resize_size=224,
+                        norm_mean=(0.485, 0.456, 0.406), norm_std=(0.229, 0.224, 0.225)):
+    """
+    resizing mode:
+        - default: resize the image to 256 and take a random resized crop of size 224;
+        - cen.crop: resize the image to 256 and take the center crop of size 224;
+        - res: resize the image to 224;
+    """
+    if resizing == 'default':
+        transform = T.Compose([
+            ResizeImage(256),
+            T.RandomResizedCrop(224)
+        ])
+    elif resizing == 'cen.crop':
+        transform = T.Compose([
+            ResizeImage(256),
+            T.CenterCrop(224)
+        ])
+    elif resizing == 'ran.crop':
+        transform = T.Compose([
+            ResizeImage(256),
+            T.RandomCrop(224)
+        ])
+    elif resizing == 'res.':
+        transform = ResizeImage(resize_size)
+    else:
+        raise NotImplementedError(resizing)
+    transforms = [transform]
+    if random_horizontal_flip:
+        transforms.append(T.RandomHorizontalFlip())
     transforms.extend([
         T.ToTensor(),
         T.Normalize(mean=norm_mean, std=norm_std)

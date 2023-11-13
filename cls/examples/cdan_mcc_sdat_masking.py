@@ -61,16 +61,26 @@ def main(args: argparse.Namespace):
 
     # Data loading code
     train_transform = utils.get_train_transform(args.train_resizing, random_horizontal_flip=not args.no_hflip,
-                                                random_color_jitter=False, resize_size=args.resize_size,
+                                                random_color_jitter=False, 
+                                                strong_aug=args.strong_aug_source, 
+                                                color_jitter_s=args.mask_color_jitter_s,
+                                                color_jitter_p=args.mask_color_jitter_p,
+                                                blur=args.mask_blur,
+                                                resize_size=args.resize_size,
+                                                norm_mean=args.norm_mean, norm_std=args.norm_std)
+    train_target_transform = utils.get_train_target_transform(args.train_resizing, 
+                                                random_horizontal_flip=not args.no_hflip,
+                                                resize_size=args.resize_size,
                                                 norm_mean=args.norm_mean, norm_std=args.norm_std)
     val_transform = utils.get_val_transform(args.val_resizing, resize_size=args.resize_size,
                                             norm_mean=args.norm_mean, norm_std=args.norm_std)
-    print("train_transform: ", train_transform)
+    print("train_source_transform: ", train_transform)
+    print("train_target_transform: ", train_target_transform)
     print("val_transform: ", val_transform)
 
     train_source_dataset, train_target_dataset, val_dataset, test_dataset, num_classes, args.class_names = \
         utils.get_dataset(args.data, args.root, args.source,
-                          args.target, train_transform, val_transform)
+                          args.target, train_transform, val_transform, train_target_transform=train_target_transform)
     train_source_loader = DataLoader(train_source_dataset, batch_size=args.batch_size,
                                      shuffle=True, num_workers=args.workers, drop_last=True)
     train_target_loader = DataLoader(train_target_dataset, batch_size=args.batch_size,
@@ -177,6 +187,18 @@ def main(args: argparse.Namespace):
             print(f'Epoch {epoch + 1} add teacher')
             classifier.train()
             teacher = EMATeacher(classifier, alpha=args.alpha, pseudo_label_weight=args.pseudo_label_weight).to(device)
+
+        if args.dynamic_mratio:
+            if epoch < 8:
+                ratio = 0.7
+            elif epoch < 12:
+                ratio = 0.7
+            elif epoch < 20:
+                ratio = 0.5
+            else:
+                ratio = 0.3
+            print(f'Epoch[{epoch + 1}] Update Masking Ratio:{ratio}')
+            masking.update_ratio(ratio)
 
         train(first_step_scaler, second_step_scaler, train_source_iter, train_target_iter, classifier, teacher,
               domain_adv, mcc_loss, masking, optimizer, ad_optimizer,
@@ -452,6 +474,10 @@ if __name__ == '__main__':
 
     # 开始加入teacher监督的轮次
     parser.add_argument('--teacher_epoch', default=1, type=int)
+    # 源数据是否使用强增强
+    parser.add_argument('--strong_aug_source', action='store_true')
+    # 是否使用变化的mask_ratio
+    parser.add_argument('--dynamic_mratio', action='store_true')
 
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [args.gpu]))
