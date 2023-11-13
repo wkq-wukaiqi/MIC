@@ -129,7 +129,7 @@ def main(args: argparse.Namespace):
 
     mcc_loss = MinimumClassConfusionLoss(temperature=args.temperature)
 
-    masking = Masking(
+    masking_t = Masking(
         block_size=args.mask_block_size,
         ratio=args.mask_ratio,
         color_jitter_s=args.mask_color_jitter_s,
@@ -137,6 +137,18 @@ def main(args: argparse.Namespace):
         blur=args.mask_blur,
         mean=args.norm_mean,
         std=args.norm_std)
+
+    if args.mask_source:
+        masking_s = Masking(
+        block_size=args.mask_block_size,
+        ratio=0.5,
+        color_jitter_s=args.mask_color_jitter_s,
+        color_jitter_p=args.mask_color_jitter_p,
+        blur=args.mask_blur,
+        mean=args.norm_mean,
+        std=args.norm_std)
+    else:
+        masking_s = None
 
     # resume from the best checkpoint
     if args.phase != 'train':
@@ -198,10 +210,10 @@ def main(args: argparse.Namespace):
             else:
                 ratio = 0.3
             print(f'Epoch[{epoch + 1}] Update Masking Ratio:{ratio}')
-            masking.update_ratio(ratio)
+            masking_t.update_ratio(ratio)
 
         train(first_step_scaler, second_step_scaler, train_source_iter, train_target_iter, classifier, teacher,
-              domain_adv, mcc_loss, masking, optimizer, ad_optimizer,
+              domain_adv, mcc_loss, masking_t, masking_s, optimizer, ad_optimizer,
               lr_scheduler, lr_scheduler_ad, epoch, args)
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
@@ -233,7 +245,7 @@ def main(args: argparse.Namespace):
 
 def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
           model: ImageClassifier, teacher: EMATeacher,
-          domain_adv: ConditionalDomainAdversarialLoss, mcc, masking, optimizer, ad_optimizer,
+          domain_adv: ConditionalDomainAdversarialLoss, mcc, masking_t, masking_s, optimizer, ad_optimizer,
           lr_scheduler: LambdaLR, lr_scheduler_ad, epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':3.1f')
     data_time = AverageMeter('Data', ':3.1f')
@@ -259,8 +271,11 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
 
         x_s = x_s.to(device)
         x_t = x_t.to(device)
+        if args.mask_source:
+            x_s = masking_s(x_s)
+
         # 生成target的mask
-        x_t_masked = masking(x_t)
+        x_t_masked = masking_t(x_t)
         labels_s = labels_s.to(device)
 
         labels_t = labels_t.to(device)
@@ -478,6 +493,8 @@ if __name__ == '__main__':
     parser.add_argument('--strong_aug_source', action='store_true')
     # 是否使用变化的mask_ratio
     parser.add_argument('--dynamic_mratio', action='store_true')
+    # 是否给源域数据加上mask（mask自带strong aug）
+    parser.add_argument('--mask_source', action='store_true')
 
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [args.gpu]))
