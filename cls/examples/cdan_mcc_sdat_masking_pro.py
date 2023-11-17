@@ -8,6 +8,7 @@ import shutil
 import os.path as osp
 import os
 import wandb
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -23,7 +24,7 @@ from dalib.modules.domain_discriminator import DomainDiscriminator
 from dalib.adaptation.cdan import ConditionalDomainAdversarialLoss, ImageClassifier
 from dalib.adaptation.mcc import MinimumClassConfusionLoss
 from dalib.modules.masking import Masking
-from dalib.modules.teacher import EMATeacher
+from dalib.modules.teacher import EMATeacherPrototype
 from common.utils.data import ForeverDataIterator
 from common.utils.metric import accuracy
 from common.utils.meter import AverageMeter, ProgressMeter
@@ -31,125 +32,35 @@ from common.utils.logger import CompleteLogger
 from common.utils.analysis import collect_feature, tsne, a_distance
 from common.utils.sam import SAM
 
+class SCELoss(nn.Module):
+    def __init__(self, num_classes=12, a=1, b=1):
+        super(SCELoss, self).__init__()
+        self.num_classes = num_classes
+        self.a = a #两个超参数
+        self.b = b
+        self.cross_entropy = nn.CrossEntropyLoss()
+
+    def forward(self, pred, labels):
+        # CE 部分，正常的交叉熵损失
+        ce = self.cross_entropy(pred, labels)
+
+        # RCE
+        pred = F.softmax(pred, dim=1)
+        pred = torch.clamp(pred, min=1e-7, max=1.0)
+        label_one_hot = F.one_hot(labels, self.num_classes).float().to(pred.device)
+        label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0) #最小设为 1e-4，即 A 取 -4
+        rce = (-1 * torch.sum(pred * torch.log(label_one_hot), dim=1))
+
+        loss = self.a * ce + self.b * rce.mean()
+        return loss
+
 sys.path.append('.')
 import utils
 
-def normalize(x, axis=-1):
-    """Normalizing to unit length along the specified dimension.
-    Args:
-      x: pytorch Variable
-    Returns:
-      x: pytorch Variable, same shape as input
-    """
-    x = 1. * x / (torch.norm(x, 2, axis, keepdim=True).expand_as(x) + 1e-12)
-    return x
-
-
-def euclidean_dist(x, y):
-    """
-    Args:
-      x: pytorch Variable, with shape [m, d]
-      y: pytorch Variable, with shape [n, d]
-    Returns:
-      dist: pytorch Variable, with shape [m, n]
-    """
-    x=x.float()
-    y=y.float()
-    m, n = x.size(0), y.size(0)
-    xx = torch.pow(x, 2).sum(1, keepdim=True).expand(m, n)
-    yy = torch.pow(y, 2).sum(1, keepdim=True).expand(n, m).t()
-    dist = xx + yy
-    dist.addmm_(x, y.t(), beta=1, alpha=-2)
-    dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
-    return dist
-
-def hard_example_mining(dist_mat, labels, return_inds=False):
-    """For each anchor, find the hardest positive and negative sample.
-    Args:
-      dist_mat: pytorch Variable, pair wise distance between samples, shape [N, N]
-      labels: pytorch LongTensor, with shape [N]
-      return_inds: whether to return the indices. Save time if `False`(?)
-    Returns:
-      dist_ap: pytorch Variable, distance(anchor, positive); shape [N]
-      dist_an: pytorch Variable, distance(anchor, negative); shape [N]
-      p_inds: pytorch LongTensor, with shape [N];
-        indices of selected hard positive samples; 0 <= p_inds[i] <= N - 1
-      n_inds: pytorch LongTensor, with shape [N];
-        indices of selected hard negative samples; 0 <= n_inds[i] <= N - 1
-    NOTE: Only consider the case in which all labels have same num of samples,
-      thus we can cope with all anchors in parallel.
-    """
-
-    assert len(dist_mat.size()) == 2
-    assert dist_mat.size(0) == dist_mat.size(1)
-    N = dist_mat.size(0)
-
-    # shape [N, N]
-    is_pos = labels.expand(N, N).eq(labels.expand(N, N).t())
-    is_neg = labels.expand(N, N).ne(labels.expand(N, N).t())
-
-    # `dist_ap` means distance(anchor, positive)
-    # both `dist_ap` and `relative_p_inds` with shape [N, 1]
-    dist_ap, relative_p_inds = torch.max(
-        (dist_mat * is_pos.float()).contiguous().view(N, -1), 1, keepdim=True)
-    # `dist_an` means distance(anchor, negative)
-    # both `dist_an` and `relative_n_inds` with shape [N, 1]
-    temp = dist_mat * is_neg.float()
-    temp[temp == 0] = 10e5
-    dist_an, relative_n_inds = torch.min(
-        (temp).contiguous().view(N, -1), 1, keepdim=True)
-    # shape [N]
-    dist_ap = dist_ap.squeeze(1)
-    dist_an = dist_an.squeeze(1)
-
-    if return_inds:
-        # shape [N, N]
-        ind = (labels.new().resize_as_(labels)
-               .copy_(torch.arange(0, N).long())
-               .unsqueeze(0).expand(N, N))
-        # shape [N, 1]
-        p_inds = torch.gather(
-            ind[is_pos].contiguous().view(N, -1), 1, relative_p_inds.data)
-        n_inds = torch.gather(
-            ind[is_neg].contiguous().view(N, -1), 1, relative_n_inds.data)
-        # shape [N]
-        p_inds = p_inds.squeeze(1)
-        n_inds = n_inds.squeeze(1)
-        return dist_ap, dist_an, p_inds, n_inds
-
-    return dist_ap, dist_an
-
-class TripletLoss(object):
-    """Modified from Tong Xiao's open-reid (https://github.com/Cysu/open-reid).
-    Related Triplet Loss theory can be found in paper 'In Defense of the Triplet
-    Loss for Person Re-Identification'."""
-
-    def __init__(self, margin=None):
-        self.margin = margin
-        if margin is not None:
-            self.ranking_loss = nn.MarginRankingLoss(margin=margin)
-        else:
-            self.ranking_loss = nn.SoftMarginLoss()
-
-    def __call__(self, feat, labels, normalize_feature=False):
-        if normalize_feature:
-            feat = normalize(feat, axis=-1)
-        if len(feat.size()) == 3:
-            raise NotImplementedError
-        else:
-            dist_mat = euclidean_dist(feat, feat)
-        dist_ap, dist_an = hard_example_mining(
-            dist_mat, labels)
-        y = dist_an.new().resize_as_(dist_an).fill_(1)
-        if self.margin is not None:
-            loss = self.ranking_loss(dist_an, dist_ap, y)
-        else:
-            loss = self.ranking_loss(dist_an - dist_ap, y)
-        return loss
-
-
 
 def main(args: argparse.Namespace):
+    assert args.resume_path is not None, 'baseline checkpoint required!'
+
     logger = CompleteLogger(args.log, args.phase)
     print(args)
 
@@ -214,37 +125,27 @@ def main(args: argparse.Namespace):
     pool_layer = nn.Identity() if args.no_pool else None
     classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim,
                                  pool_layer=pool_layer, finetune=not args.scratch).to(device)
-    classifier_feature_dim = classifier.features_dim
 
-    if args.randomized:
-        domain_discri = DomainDiscriminator(
-            args.randomized_dim, hidden_size=1024).to(device)
-    else:
-        domain_discri = DomainDiscriminator(
-            classifier_feature_dim * num_classes, hidden_size=1024).to(device)
+    # 加载classifier的baseline模型
+    baseline_dict = torch.load(args.resume_path)
+    classifier.load_state_dict(baseline_dict)
+
+    teacher = EMATeacherPrototype(classifier, 
+                                  alpha=args.alpha, 
+                                  pseudo_label_weight=args.pseudo_label_weight,
+                                  threshold=args.pseudo_threshold).to(device)
+    init_teacher(teacher, val_loader, device)
 
     # define optimizer and lr scheduler
-    base_optimizer = torch.optim.SGD
-    ad_optimizer = SGD(domain_discri.get_parameters(
-    ), args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
-    optimizer = SAM(classifier.get_parameters(), base_optimizer, rho=args.rho, adaptive=False,
-                    lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
+    optimizer = torch.optim.SGD(classifier.get_parameters(), 
+                                     lr=args.lr, 
+                                     momentum=args.momentum, 
+                                     weight_decay=args.weight_decay)
     lr_scheduler = LambdaLR(optimizer, lambda x: args.lr *
                             (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
-    lr_scheduler_ad = LambdaLR(
-        ad_optimizer, lambda x: args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
-
-    # define loss function
-    domain_adv = ConditionalDomainAdversarialLoss(
-        domain_discri, entropy_conditioning=args.entropy,
-        num_classes=num_classes, features_dim=classifier_feature_dim, randomized=args.randomized,
-        randomized_dim=args.randomized_dim
-    ).to(device)
 
     mcc_loss = MinimumClassConfusionLoss(temperature=args.temperature)
-
-    triplet_loss=TripletLoss(margin=0.3)
-
+    
     masking_t = Masking(
         block_size=args.mask_block_size,
         ratio=args.mask_ratio,
@@ -266,55 +167,16 @@ def main(args: argparse.Namespace):
     else:
         masking_s = None
 
-    # resume from the best checkpoint
-    if args.phase != 'train':
-        checkpoint = torch.load(
-            logger.get_checkpoint_path('best'), map_location='cpu')
-        classifier.load_state_dict(checkpoint)
-
-    # analysis the model
-    if args.phase == 'analysis':
-        # extract features from both domains
-        feature_extractor = nn.Sequential(
-            classifier.backbone, classifier.pool_layer, classifier.bottleneck).to(device)
-        source_feature = collect_feature(
-            train_source_loader, feature_extractor, device)
-        target_feature = collect_feature(
-            train_target_loader, feature_extractor, device)
-        # plot t-SNE
-        tSNE_filename = osp.join(logger.visualize_directory, 'TSNE.pdf')
-        tsne.visualize(source_feature, target_feature, tSNE_filename)
-        print("Saving t-SNE to", tSNE_filename)
-        # calculate A-distance, which is a measure for distribution discrepancy
-        A_distance = a_distance.calculate(
-            source_feature, target_feature, device)
-        print("A-distance =", A_distance)
-        return
-
-    if args.phase == 'test':
-        acc1 = utils.validate(test_loader, classifier, args, device)
-        print(acc1)
-        return
-
     # start training
-    # classifier = nn.DataParallel(classifier)
-    # teacher = nn.DataParallel(teacher)
     best_acc1 = 0.
-    first_step_scaler=GradScaler()
-    second_step_scaler=GradScaler()
-    teacher = None
+    scaler=GradScaler()
+    sce_loss = SCELoss(num_classes=num_classes, a=0.1, b=1)
     for epoch in range(args.epochs):
         print("lr_bbone:", lr_scheduler.get_last_lr()[0])
         print("lr_btlnck:", lr_scheduler.get_last_lr()[1])
         if args.log_results:
             wandb.log({"lr_bbone": lr_scheduler.get_last_lr()[0],
                        "lr_btlnck": lr_scheduler.get_last_lr()[1]})
-        # train for one epoch
-
-        if teacher is None and (epoch + 1) >= args.teacher_epoch:
-            print(f'Epoch {epoch + 1} add teacher')
-            classifier.train()
-            teacher = EMATeacher(classifier, alpha=args.alpha, pseudo_label_weight=args.pseudo_label_weight).to(device)
 
         if args.dynamic_mratio:
             if epoch < 8:
@@ -328,9 +190,10 @@ def main(args: argparse.Namespace):
             print(f'Epoch[{epoch + 1}] Update Masking Ratio:{ratio}')
             masking_t.update_ratio(ratio)
 
-        train(first_step_scaler, second_step_scaler, train_source_iter, train_target_iter, classifier, teacher,
-              domain_adv, mcc_loss, triplet_loss, masking_t, masking_s, optimizer, ad_optimizer,
-              lr_scheduler, lr_scheduler_ad, epoch, args)
+        # train for one epoch
+        train(scaler, train_source_iter, train_target_iter, classifier, teacher,
+              sce_loss, mcc_loss, masking_t, masking_s, optimizer, lr_scheduler, epoch, args)
+        
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
         if args.log_results:
@@ -347,33 +210,57 @@ def main(args: argparse.Namespace):
     print("best_acc1 = {:3.1f}".format(best_acc1))
 
     # evaluate on test set
-    # classifier.load_state_dict(torch.load(logger.get_checkpoint_path('best')))
-    # acc1 = utils.validate(test_loader, classifier, args, device)
-    # print("test_acc1 = {:3.1f}".format(acc1))
-    # if args.log_results:
-    #     wandb.log({'epoch': epoch, 'test_acc': acc1})
+    classifier.load_state_dict(torch.load(logger.get_checkpoint_path('best')))
+    acc1 = utils.validate(test_loader, classifier, args, device)
+    print("test_acc1 = {:3.1f}".format(acc1))
+    if args.log_results:
+        wandb.log({'epoch': epoch, 'test_acc': acc1})
 
     if args.log_results:
         wandb.finish()
 
     logger.close()
 
+def init_teacher(teacher, val_loader, device):
+    """
+    初始化teacher，计算原型
+    """
+    loop = tqdm(enumerate(val_loader), total=len(val_loader))
+    loop.set_description(f'Initializing Teacher...')
+    teacher.init_begin()
+    pseudo_label_usages = AverageMeter('Pseudo Usage', ':3.3f')
+    with torch.no_grad():
+        for _, (images, _) in loop:
+            images = images.to(device)
+            pseudo_label_usage = teacher.init_prototypes(images)
+            pseudo_label_usages.update(pseudo_label_usage / images.size(0), images.size(0))
+    teacher.init_end()
+    print(f'Pseudo Label Usage: {100*pseudo_label_usages.avg:.2f}%')
 
-def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
-          model: ImageClassifier, teacher: EMATeacher,
-          domain_adv: ConditionalDomainAdversarialLoss, mcc, triplet_loss, masking_t, masking_s, optimizer, ad_optimizer,
-          lr_scheduler: LambdaLR, lr_scheduler_ad, epoch: int, args: argparse.Namespace):
+
+def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
+          model: ImageClassifier, teacher: EMATeacherPrototype,
+          sce_loss, mcc, masking_t, masking_s, optimizer, lr_scheduler: LambdaLR,
+          epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':3.1f')
     data_time = AverageMeter('Data', ':3.1f')
-    losses = AverageMeter('Loss', ':3.2f')
-    trans_losses = AverageMeter('Trans Loss', ':3.2f')
+    losses = AverageMeter('Loss', ':3.3f')
+    cls_losses = AverageMeter('Cls Loss', ':3.3f')
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
-    domain_accs = AverageMeter('Domain Acc', ':3.1f')
+    mask_losses = AverageMeter('Mask Loss', ':3.3f')
+    kd_losses = AverageMeter('KD Loss', ':3.3f')
+    # mcc_losses = AverageMeter('MCC Loss', ':3.3f')
     pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
-    log_list = [batch_time, data_time, losses, trans_losses, cls_accs, domain_accs, pseudo_label_accs]
-    if args.triplet:
-        triplet_losses = AverageMeter('Triplet Loss', ':3.2f')
-        log_list.append(triplet_losses)
+    log_list = [batch_time, 
+                data_time, 
+                losses,
+                cls_losses, 
+                mask_losses, 
+                kd_losses,
+                # mcc_losses,
+                pseudo_label_accs,
+                cls_accs]
+
     progress = ProgressMeter(
         args.iters_per_epoch,
         log_list,
@@ -381,7 +268,6 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
 
     # switch to train mode
     model.train()
-    domain_adv.train()
 
     end = time.time()
     for i in range(args.iters_per_epoch):
@@ -403,120 +289,76 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
         # measure data loading time
         data_time.update(time.time() - end)
         optimizer.zero_grad()
-        ad_optimizer.zero_grad()
 
         # generate pseudo-label
-        # teacher.module.update_weights(model, epoch * args.iters_per_epoch + i)
-        if teacher is not None:
-            teacher.update_weights(model, epoch * args.iters_per_epoch + i)
-            pseudo_label_t, pseudo_prob_t, ema_softmax  = teacher(x_t)
-            pseudo_label_acc, = accuracy(ema_softmax, labels_t, topk=(1,))
-
-        # compute output
-        with autocast():
-            x = torch.cat((x_s, x_t), dim=0)
-            # f是feature，y是预测
-            y, f = model(x)
-            y_s, y_t = y.chunk(2, dim=0)
-            f_s, f_t = f.chunk(2, dim=0)
-            cls_loss = F.cross_entropy(y_s, labels_s)
-            # SDAT论文里的MinimumClassConfusionLoss，直接用
-            mcc_loss_value = mcc(y_t)
-            # mask数据的预测
-            # y_t_masked, _ = model(x_t_masked)
-            # if teacher.module.pseudo_label_weight is not None:
-            # 用mask的预测结果和伪标签计算CE
-            # masking_loss_value就是所谓的 MIC loss
-            if teacher is not None:
-                # 5轮后才加入teacher
-                y_t_masked, _ = model(x_t_masked)
-                if teacher.pseudo_label_weight is not None:
-                    ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
-                    masking_loss_value = torch.mean(pseudo_prob_t * ce)
-                else:
-                    masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
-                # 损失由源域数据分类损失、MCC损失、目标域mask后的分类损失（MIC loss）组成
-                # 相当于是源域和目标域一起训练
-                loss = cls_loss + mcc_loss_value + masking_loss_value
-            else:
-                loss = cls_loss + mcc_loss_value
-            if args.triplet:
-                triplet_loss_value = triplet_loss(f_s, labels_s) + triplet_loss(f_t, pseudo_label_t)
-                loss = loss + triplet_loss_value
-
-        first_step_scaler.scale(loss).backward()
-        first_step_scaler.unscale_(optimizer)
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
-
-        optimizer_state = first_step_scaler._per_optimizer_states[id(optimizer)]
-
-        # Check if any gradients are inf/nan
-        inf_grad_cnt = sum(v.item() for v in optimizer_state["found_inf_per_device"].values())
-
-        if inf_grad_cnt == 0:
-            # if valid graident, apply sam_first_step
-            optimizer.first_step(zero_grad=True)
-            sam_first_step_applied = True
-        else:
-            # if invalid graident, skip sam and revert to single optimization step
-            optimizer.zero_grad()
-            sam_first_step_applied = False
-        first_step_scaler.update()
+        teacher.update_weights(model, epoch * args.iters_per_epoch + i)
+        pseudo_prob_t, pseudo_label_t, ema_softmax, features_teacher  = teacher(x_t)
+        pseudo_label_acc, = accuracy(ema_softmax, labels_t, topk=(1,))
 
         # Calculate task loss and domain loss
         with autocast():
+            x = torch.cat((x_s, x_t), dim=0)
             y, f = model(x)
             y_s, y_t = y.chunk(2, dim=0)
-            f_s, f_t = f.chunk(2, dim=0)
+            # f_s, f_t = f.chunk(2, dim=0)
 
+            # 源域分类损失
             cls_loss = F.cross_entropy(y_s, labels_s)
-            # y_t_masked, _ = model(x_t_masked)
-            if teacher is not None:
-                y_t_masked, _ = model(x_t_masked)
-                transfer_loss = domain_adv(y_s, f_s, y_t, f_t) + mcc(y_t) + \
-                            F.cross_entropy(y_t_masked, pseudo_label_t)
+            # 目标域分类损失
+            # cls_loss = cls_loss + F.cross_entropy(y_t, pseudo_label_t)
+            # mcc_loss_value = mcc(y_t)
+
+            y_t_masked, f_t_masked = model(x_t_masked)
+
+            # 强增强目标域数据损失
+            # masking_loss_value = sce_loss(y_t_masked, pseudo_label_t)
+            # masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+            if teacher.pseudo_label_weight is not None:
+                ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
+                masking_loss_value = torch.mean(pseudo_prob_t * ce)
             else:
-                transfer_loss = domain_adv(y_s, f_s, y_t, f_t) + mcc(y_t)
-            domain_acc = domain_adv.domain_discriminator_accuracy
-            # 来自SDAT的步骤，最终的损失除了上面的源域数据分类损失、MCC损失、MIC loss
-            # 还有一个ConditionalDomainAdversarialLoss，即CDAN，这也是SDAT的一个组成部分
-            # 简单来说就是一个对抗训练，用于提取域不变特征
-            if args.triplet:
-                triplet_loss_value = triplet_loss(f_s, labels_s) + triplet_loss(f_t, pseudo_label_t)
-                loss = triplet_loss_value + cls_loss + transfer_loss * args.trade_off
-            else:
-                loss = cls_loss + transfer_loss * args.trade_off            
+                masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+            
+            # 一致性KL散度损失
+            teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
+            student_distance = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
+            kd_loss = 10*F.kl_div(
+                F.log_softmax(-student_distance, dim=1), 
+                F.softmax(-teacher_distance, dim=1),
+                reduction='mean'
+            )
+
+            # 总损失
+            loss = cls_loss + kd_loss + masking_loss_value
 
         cls_acc = accuracy(y_s, labels_s)[0]
         if args.log_results:
             # masked_img = wandb.Image(x_t_masked, caption="Masked Image")
             wandb.log({
                 'iteration': epoch*args.iters_per_epoch + i, 'loss': loss, 'cls_loss': cls_loss,
-                'transfer_loss': transfer_loss, 'domain_acc': domain_acc, 'pseudo_weight_avg': torch.mean(pseudo_prob_t),
+                'kd_loss': kd_loss,
+                'pseudo_weight_avg': torch.mean(pseudo_prob_t),
                 # 'masked_img': masked_img,
            })
 
         losses.update(loss.item(), x_s.size(0))
+        cls_losses.update(cls_loss.item(), x_s.size(0))
         cls_accs.update(cls_acc, x_s.size(0))
-        domain_accs.update(domain_acc, x_s.size(0))
-        trans_losses.update(transfer_loss.item(), x_s.size(0))
-        if teacher is not None:
-            pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
-        if args.triplet:
-            triplet_losses.update(triplet_loss_value.item(), x_s.size(0))
+        pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
+        mask_losses.update(masking_loss_value.item(), x_s.size(0))
+        kd_losses.update(kd_loss.item(), x_s.size(0))
+        # mcc_losses.update(mcc_loss_value.item(), x_s.size(0))
 
-        second_step_scaler.scale(loss).backward()
-        second_step_scaler.unscale_(optimizer)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
-        if sam_first_step_applied:
-            optimizer.second_step()
-        second_step_scaler.step(optimizer)
-        second_step_scaler.step(ad_optimizer)
-        second_step_scaler.update()
+        scaler.step(optimizer)
+        scaler.update()
+
+        # 更新原型，按照论文代码，使用的是teacher的输出
+        teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
 
         lr_scheduler.step()
-        lr_scheduler_ad.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -624,8 +466,10 @@ if __name__ == '__main__':
     parser.add_argument('--dynamic_mratio', action='store_true')
     # 是否给源域数据加上mask（mask自带strong aug）
     parser.add_argument('--mask_source', action='store_true')
-    # 是否使用三元损失
-    parser.add_argument('--triplet', action='store_true')
+    # baseline预训练模型地址
+    parser.add_argument('--resume_path', default=None, type=str)
+    # 伪标签置信度阈值
+    parser.add_argument('--pseudo_threshold', default=0.9, type=float)
 
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [args.gpu]))
