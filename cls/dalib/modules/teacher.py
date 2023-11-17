@@ -145,6 +145,7 @@ class EMATeacherPrototype(nn.Module):
 
         _, features = self.ema_model(target_img)
         logits, _ = self.ema_model_fix(target_img)
+        # logits, features = self.ema_model(target_img)
         ema_softmax = torch.softmax(logits.detach(), dim=1)
 
         # 计算w

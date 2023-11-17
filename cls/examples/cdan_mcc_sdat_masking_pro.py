@@ -38,11 +38,11 @@ class SCELoss(nn.Module):
         self.num_classes = num_classes
         self.a = a #两个超参数
         self.b = b
-        self.cross_entropy = nn.CrossEntropyLoss()
 
-    def forward(self, pred, labels):
+    def forward(self, pred, labels, reduction='mean'):
+        assert reduction in ['none', 'mean']
         # CE 部分，正常的交叉熵损失
-        ce = self.cross_entropy(pred, labels)
+        ce = F.cross_entropy(pred, labels, reduction=reduction)
 
         # RCE
         pred = F.softmax(pred, dim=1)
@@ -51,7 +51,13 @@ class SCELoss(nn.Module):
         label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0) #最小设为 1e-4，即 A 取 -4
         rce = (-1 * torch.sum(pred * torch.log(label_one_hot), dim=1))
 
-        loss = self.a * ce + self.b * rce.mean()
+        if reduction == 'mean':
+            loss = self.a * ce + self.b * rce.mean()
+        elif reduction == 'none':
+            loss = self.a * ce + self.b * rce
+        else:
+            raise NotImplementedError
+        
         return loss
 
 sys.path.append('.')
@@ -143,8 +149,6 @@ def main(args: argparse.Namespace):
                                      weight_decay=args.weight_decay)
     lr_scheduler = LambdaLR(optimizer, lambda x: args.lr *
                             (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
-
-    mcc_loss = MinimumClassConfusionLoss(temperature=args.temperature)
     
     masking_t = Masking(
         block_size=args.mask_block_size,
@@ -192,7 +196,7 @@ def main(args: argparse.Namespace):
 
         # train for one epoch
         train(scaler, train_source_iter, train_target_iter, classifier, teacher,
-              sce_loss, mcc_loss, masking_t, masking_s, optimizer, lr_scheduler, epoch, args)
+              sce_loss, masking_t, masking_s, optimizer, lr_scheduler, epoch, args)
         
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
@@ -240,7 +244,7 @@ def init_teacher(teacher, val_loader, device):
 
 def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
           model: ImageClassifier, teacher: EMATeacherPrototype,
-          sce_loss, mcc, masking_t, masking_s, optimizer, lr_scheduler: LambdaLR,
+          sce_loss, masking_t, masking_s, optimizer, lr_scheduler: LambdaLR,
           epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':3.1f')
     data_time = AverageMeter('Data', ':3.1f')
@@ -249,7 +253,6 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
     mask_losses = AverageMeter('Mask Loss', ':3.3f')
     kd_losses = AverageMeter('KD Loss', ':3.3f')
-    # mcc_losses = AverageMeter('MCC Loss', ':3.3f')
     pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
     log_list = [batch_time, 
                 data_time, 
@@ -257,7 +260,6 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
                 cls_losses, 
                 mask_losses, 
                 kd_losses,
-                # mcc_losses,
                 pseudo_label_accs,
                 cls_accs]
 
@@ -297,16 +299,10 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
         # Calculate task loss and domain loss
         with autocast():
-            x = torch.cat((x_s, x_t), dim=0)
-            y, f = model(x)
-            y_s, y_t = y.chunk(2, dim=0)
-            # f_s, f_t = f.chunk(2, dim=0)
+            y_s, _ = model(x_s)
 
             # 源域分类损失
             cls_loss = F.cross_entropy(y_s, labels_s)
-            # 目标域分类损失
-            # cls_loss = cls_loss + F.cross_entropy(y_t, pseudo_label_t)
-            # mcc_loss_value = mcc(y_t)
 
             y_t_masked, f_t_masked = model(x_t_masked)
 
@@ -314,17 +310,24 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
             # masking_loss_value = sce_loss(y_t_masked, pseudo_label_t)
             # masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
             if teacher.pseudo_label_weight is not None:
-                ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
+                if args.sce_loss:
+                    ce = sce_loss(y_t_masked, pseudo_label_t, reduction='none')
+                else:
+                    ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
                 masking_loss_value = torch.mean(pseudo_prob_t * ce)
             else:
-                masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+                if args.sce_loss:
+                    masking_loss_value = sce_loss(y_t_masked, pseudo_label_t)
+                else:
+                    masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
             
             # 一致性KL散度损失
             teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
             student_distance = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
+            
             kd_loss = 10*F.kl_div(
                 F.log_softmax(-student_distance, dim=1), 
-                F.softmax(-teacher_distance, dim=1),
+                F.softmax(-teacher_distance.detach(), dim=1),
                 reduction='mean'
             )
 
@@ -347,7 +350,6 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
         mask_losses.update(masking_loss_value.item(), x_s.size(0))
         kd_losses.update(kd_loss.item(), x_s.size(0))
-        # mcc_losses.update(mcc_loss_value.item(), x_s.size(0))
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -470,6 +472,8 @@ if __name__ == '__main__':
     parser.add_argument('--resume_path', default=None, type=str)
     # 伪标签置信度阈值
     parser.add_argument('--pseudo_threshold', default=0.9, type=float)
+    # 是否使用sce loss
+    parser.add_argument('--sce_loss', action='store_true')
 
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [args.gpu]))
