@@ -197,6 +197,7 @@ class EMATeacherPrototype(nn.Module):
         else:
             # 更新时全用
             high_confidence_idx = torch.nonzero(pseudo_prob > 0).squeeze()
+        # high_confidence_idx = torch.nonzero(pseudo_prob > self.threshold).squeeze()
         
         if high_confidence_idx.size() != torch.Size([0]):
             # 更新原型

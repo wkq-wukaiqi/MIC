@@ -299,22 +299,23 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
         # Calculate task loss and domain loss
         with autocast():
-            y_s, _ = model(x_s)
+            x = torch.cat((x_s, x_t), dim=0)
+            y, f = model(x)
+            y_s, y_t = y.chunk(2, dim=0)
+            f_s, f_t = f.chunk(2, dim=0)
 
             # 源域分类损失
             cls_loss = F.cross_entropy(y_s, labels_s)
 
             y_t_masked, f_t_masked = model(x_t_masked)
 
-            # 强增强目标域数据损失
-            # masking_loss_value = sce_loss(y_t_masked, pseudo_label_t)
-            # masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+            # mask一致性损失
             if teacher.pseudo_label_weight is not None:
                 if args.sce_loss:
                     ce = sce_loss(y_t_masked, pseudo_label_t, reduction='none')
                 else:
                     ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
-                masking_loss_value = torch.mean(pseudo_prob_t * ce)
+                masking_loss_value = torch.mean(pseudo_prob_t* ce)
             else:
                 if args.sce_loss:
                     masking_loss_value = sce_loss(y_t_masked, pseudo_label_t)
