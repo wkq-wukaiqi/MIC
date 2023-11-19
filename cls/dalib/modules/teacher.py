@@ -4,7 +4,7 @@ import torch
 from timm.models.layers import DropPath
 from torch import nn
 from torch.nn.modules.dropout import _DropoutNd
-from torch.nn.modules.batchnorm import BatchNorm2d
+from torch.nn.modules.batchnorm import _BatchNorm
 import torch.nn.functional as F
 
 
@@ -78,10 +78,6 @@ class EMATeacherPrototype(nn.Module):
         self.ema_model = deepcopy(model)
         # 按照ProDA论文，softmax软标签是固定的
         self.ema_model_fix = deepcopy(model)
-        for m in self.ema_model_fix.modules():
-            if isinstance(m, BatchNorm2d):
-                m.training = False
-                m.requires_grad_(False)
         self.alpha = alpha
         self.pseudo_label_weight = pseudo_label_weight
         if self.pseudo_label_weight == 'None':
@@ -141,12 +137,16 @@ class EMATeacherPrototype(nn.Module):
                 m.training = False
             if isinstance(m, DropPath):
                 m.training = False
+            if isinstance(m, _BatchNorm):
+                m.eval()
 
         for m in self.ema_model_fix.modules():
             if isinstance(m, _DropoutNd):
                 m.training = False
             if isinstance(m, DropPath):
                 m.training = False
+            if isinstance(m, _BatchNorm):
+                m.eval()
 
         _, features = self.ema_model(target_img)
         logits, _ = self.ema_model_fix(target_img)
@@ -178,12 +178,14 @@ class EMATeacherPrototype(nn.Module):
     @torch.no_grad()
     def init_prototypes(self, target_img):
         # Generate pseudo-label
-        for m in self.ema_model.modules():
+        for m in self.ema_model_fix.modules():
             if isinstance(m, _DropoutNd):
                 m.training = False
             if isinstance(m, DropPath):
                 m.training = False
-        logits, features = self.ema_model(target_img)
+            if isinstance(m, _BatchNorm):
+                m.eval()
+        logits, features = self.ema_model_fix(target_img)
 
         ema_softmax = torch.softmax(logits.detach(), dim=1)
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
