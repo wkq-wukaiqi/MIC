@@ -32,37 +32,8 @@ from common.utils.logger import CompleteLogger
 from common.utils.analysis import collect_feature, tsne, a_distance
 from common.utils.sam import SAM
 
-class SCELoss(nn.Module):
-    def __init__(self, num_classes=12, a=1, b=1):
-        super(SCELoss, self).__init__()
-        self.num_classes = num_classes
-        self.a = a #两个超参数
-        self.b = b
-
-    def forward(self, pred, labels, reduction='mean'):
-        assert reduction in ['none', 'mean']
-        # CE 部分，正常的交叉熵损失
-        ce = F.cross_entropy(pred, labels, reduction=reduction)
-
-        # RCE
-        pred = F.softmax(pred, dim=1)
-        pred = torch.clamp(pred, min=1e-7, max=1.0)
-        label_one_hot = F.one_hot(labels, self.num_classes).float().to(pred.device)
-        label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0) #最小设为 1e-4，即 A 取 -4
-        rce = (-1 * torch.sum(pred * torch.log(label_one_hot), dim=1))
-
-        if reduction == 'mean':
-            loss = self.a * ce + self.b * rce.mean()
-        elif reduction == 'none':
-            loss = self.a * ce + self.b * rce
-        else:
-            raise NotImplementedError
-        
-        return loss
-
 sys.path.append('.')
 import utils
-
 
 def main(args: argparse.Namespace):
     assert args.resume_path is not None, 'baseline checkpoint required!'
@@ -174,7 +145,6 @@ def main(args: argparse.Namespace):
     # start training
     best_acc1 = 0.
     scaler=GradScaler()
-    sce_loss = SCELoss(num_classes=num_classes, a=0.1, b=1)
     for epoch in range(args.epochs):
         print("lr_bbone:", lr_scheduler.get_last_lr()[0])
         print("lr_btlnck:", lr_scheduler.get_last_lr()[1])
@@ -196,7 +166,7 @@ def main(args: argparse.Namespace):
 
         # train for one epoch
         train(scaler, train_source_iter, train_target_iter, classifier, teacher,
-              sce_loss, masking_t, masking_s, optimizer, lr_scheduler, epoch, args)
+              masking_t, masking_s, optimizer, lr_scheduler, epoch, args)
         
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
@@ -244,7 +214,7 @@ def init_teacher(teacher, val_loader, device):
 
 def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
           model: ImageClassifier, teacher: EMATeacherPrototype,
-          sce_loss, masking_t, masking_s, optimizer, lr_scheduler: LambdaLR,
+          masking_t, masking_s, optimizer, lr_scheduler: LambdaLR,
           epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':3.1f')
     data_time = AverageMeter('Data', ':3.1f')
@@ -311,29 +281,23 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
             # mask一致性损失
             if teacher.pseudo_label_weight is not None:
-                if args.sce_loss:
-                    ce = sce_loss(y_t_masked, pseudo_label_t, reduction='none')
-                else:
-                    ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
+                ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
                 masking_loss_value = torch.mean(pseudo_prob_t* ce)
             else:
-                if args.sce_loss:
-                    masking_loss_value = sce_loss(y_t_masked, pseudo_label_t)
-                else:
-                    masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
-            
+                masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+
             # 一致性KL散度损失
             teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
-            student_distance = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
+            # student_distance = torch.cdist(f_t, teacher.prototypes.detach(), p=2)
+            student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
             
-            kd_loss = 10*F.kl_div(
-                F.log_softmax(-student_distance, dim=1), 
-                F.softmax(-teacher_distance.detach(), dim=1),
-                reduction='mean'
-            )
+            # kd_loss = F.kl_div(F.log_softmax(-student_distance, dim=1), F.softmax(-teacher_distance.detach(), dim=1)) + \
+            #           F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
+            
+            kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
 
             # 总损失
-            loss = cls_loss + kd_loss + masking_loss_value
+            loss = cls_loss + 10*kd_loss + masking_loss_value
 
         cls_acc = accuracy(y_s, labels_s)[0]
         if args.log_results:
@@ -473,8 +437,6 @@ if __name__ == '__main__':
     parser.add_argument('--resume_path', default=None, type=str)
     # 伪标签置信度阈值
     parser.add_argument('--pseudo_threshold', default=0.9, type=float)
-    # 是否使用sce loss
-    parser.add_argument('--sce_loss', action='store_true')
 
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [args.gpu]))

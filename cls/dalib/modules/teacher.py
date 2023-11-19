@@ -4,6 +4,7 @@ import torch
 from timm.models.layers import DropPath
 from torch import nn
 from torch.nn.modules.dropout import _DropoutNd
+from torch.nn.modules.batchnorm import BatchNorm2d
 import torch.nn.functional as F
 
 
@@ -77,6 +78,10 @@ class EMATeacherPrototype(nn.Module):
         self.ema_model = deepcopy(model)
         # 按照ProDA论文，softmax软标签是固定的
         self.ema_model_fix = deepcopy(model)
+        for m in self.ema_model_fix.modules():
+            if isinstance(m, BatchNorm2d):
+                m.training = False
+                m.requires_grad_(False)
         self.alpha = alpha
         self.pseudo_label_weight = pseudo_label_weight
         if self.pseudo_label_weight == 'None':
