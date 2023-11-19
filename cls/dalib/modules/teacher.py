@@ -137,8 +137,6 @@ class EMATeacherPrototype(nn.Module):
                 m.training = False
             if isinstance(m, DropPath):
                 m.training = False
-            if isinstance(m, _BatchNorm):
-                m.eval()
 
         for m in self.ema_model_fix.modules():
             if isinstance(m, _DropoutNd):
