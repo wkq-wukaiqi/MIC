@@ -88,9 +88,9 @@ def main(args: argparse.Namespace):
     train_target_loader = DataLoader(train_target_dataset, batch_size=args.batch_size,
                                      shuffle=True, num_workers=args.workers, drop_last=True)
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size*4, shuffle=False, num_workers=args.workers)
+        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size*4, shuffle=False, num_workers=args.workers)
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
 
     train_source_iter = ForeverDataIterator(train_source_loader)
     train_target_iter = ForeverDataIterator(train_target_loader)
@@ -106,6 +106,14 @@ def main(args: argparse.Namespace):
     # 加载classifier的baseline模型
     baseline_dict = torch.load(args.resume_path)
     classifier.load_state_dict(baseline_dict)
+    classifier_feature_dim = classifier.features_dim
+
+    if args.randomized:
+        domain_discri = DomainDiscriminator(
+            args.randomized_dim, hidden_size=1024).to(device)
+    else:
+        domain_discri = DomainDiscriminator(
+            classifier_feature_dim * num_classes, hidden_size=1024).to(device)
 
     teacher = EMATeacherPrototype(classifier, 
                                   alpha=args.alpha, 
@@ -114,12 +122,27 @@ def main(args: argparse.Namespace):
     init_teacher(teacher, val_loader, device)
 
     # define optimizer and lr scheduler
-    optimizer = torch.optim.SGD(classifier.get_parameters(), 
-                                     lr=args.lr, 
-                                     momentum=args.momentum, 
-                                     weight_decay=args.weight_decay)
+    # optimizer = torch.optim.SGD(classifier.get_parameters(), 
+    #                                  lr=args.lr, 
+    #                                  momentum=args.momentum, 
+    #                                  weight_decay=args.weight_decay)
+    base_optimizer = torch.optim.SGD
+    ad_optimizer = SGD(domain_discri.get_parameters(
+    ), args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
+    optimizer = SAM(classifier.get_parameters(), base_optimizer, rho=args.rho, adaptive=False,
+                    lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     lr_scheduler = LambdaLR(optimizer, lambda x: args.lr *
                             (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
+    lr_scheduler_ad = LambdaLR(
+        ad_optimizer, lambda x: args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
+    
+    domain_adv = ConditionalDomainAdversarialLoss(
+        domain_discri, entropy_conditioning=args.entropy,
+        num_classes=num_classes, features_dim=classifier_feature_dim, randomized=args.randomized,
+        randomized_dim=args.randomized_dim
+    ).to(device)
+
+    mcc_loss = MinimumClassConfusionLoss(temperature=args.temperature)
     
     masking_t = Masking(
         block_size=args.mask_block_size,
@@ -144,7 +167,9 @@ def main(args: argparse.Namespace):
 
     # start training
     best_acc1 = 0.
-    scaler=GradScaler()
+    # scaler=GradScaler()
+    first_step_scaler=GradScaler()
+    second_step_scaler=GradScaler()
     for epoch in range(args.epochs):
         print("lr_bbone:", lr_scheduler.get_last_lr()[0])
         print("lr_btlnck:", lr_scheduler.get_last_lr()[1])
@@ -165,8 +190,8 @@ def main(args: argparse.Namespace):
             masking_t.update_ratio(ratio)
 
         # train for one epoch
-        train(scaler, train_source_iter, train_target_iter, classifier, teacher,
-              masking_t, masking_s, optimizer, lr_scheduler, epoch, args)
+        train(first_step_scaler, second_step_scaler, train_source_iter, train_target_iter, classifier, teacher,
+              domain_adv, mcc_loss, masking_t, masking_s, optimizer, ad_optimizer, lr_scheduler, lr_scheduler_ad, epoch, args)
         
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
@@ -212,9 +237,9 @@ def init_teacher(teacher, val_loader, device):
     print(f'Pseudo Label Usage: {100*pseudo_label_usages.avg:.2f}%')
 
 
-def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
-          model: ImageClassifier, teacher: EMATeacherPrototype,
-          masking_t, masking_s, optimizer, lr_scheduler: LambdaLR,
+def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
+          model: ImageClassifier, teacher: EMATeacherPrototype, domain_adv: ConditionalDomainAdversarialLoss, mcc,
+          masking_t, masking_s, optimizer, ad_optimizer, lr_scheduler: LambdaLR, lr_scheduler_ad,
           epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':3.1f')
     data_time = AverageMeter('Data', ':3.1f')
@@ -223,6 +248,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
     mask_losses = AverageMeter('Mask Loss', ':3.3f')
     kd_losses = AverageMeter('KD Loss', ':3.3f')
+    domain_accs = AverageMeter('Domain Acc', ':3.1f')
     pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
     log_list = [batch_time, 
                 data_time, 
@@ -230,6 +256,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
                 cls_losses, 
                 mask_losses, 
                 kd_losses,
+                domain_accs,
                 pseudo_label_accs,
                 cls_accs]
 
@@ -240,6 +267,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
     # switch to train mode
     model.train()
+    domain_adv.train()
 
     end = time.time()
     for i in range(args.iters_per_epoch):
@@ -261,6 +289,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         # measure data loading time
         data_time.update(time.time() - end)
         optimizer.zero_grad()
+        ad_optimizer.zero_grad()
 
         # generate pseudo-label
         teacher.update_weights(model, epoch * args.iters_per_epoch + i)
@@ -276,6 +305,70 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
             # 源域分类损失
             cls_loss = F.cross_entropy(y_s, labels_s)
+
+            # # 源域+目标域分类损失
+            # cls_loss = F.cross_entropy(y_s, labels_s) + \
+            #     torch.mean(pseudo_prob_t* F.cross_entropy(y_t, pseudo_label_t, reduction='none'))
+
+            mcc_loss_value = mcc(y_t)
+
+            y_t_masked, f_t_masked = model(x_t_masked)
+
+            # mask一致性损失
+            if teacher.pseudo_label_weight is not None:
+                ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
+                masking_loss_value = torch.mean(pseudo_prob_t* ce)
+            else:
+                masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+
+            # 一致性KL散度损失
+            teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
+            
+            # student_distance = torch.cdist(f_t, teacher.prototypes.detach(), p=2)
+            student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
+            
+            # kd_loss = F.kl_div(F.log_softmax(-student_distance, dim=1), F.softmax(-teacher_distance.detach(), dim=1)) + \
+            #           F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
+            
+            kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
+
+            # 总损失
+            loss = cls_loss + 10*kd_loss + masking_loss_value + mcc_loss_value
+            # loss = cls_loss + 10*kd_loss + masking_loss_value
+
+        first_step_scaler.scale(loss).backward()
+        first_step_scaler.unscale_(optimizer)
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
+
+        optimizer_state = first_step_scaler._per_optimizer_states[id(optimizer)]
+
+        # Check if any gradients are inf/nan
+        inf_grad_cnt = sum(v.item() for v in optimizer_state["found_inf_per_device"].values())
+
+        if inf_grad_cnt == 0:
+            # if valid graident, apply sam_first_step
+            optimizer.first_step(zero_grad=True)
+            sam_first_step_applied = True
+        else:
+            # if invalid graident, skip sam and revert to single optimization step
+            optimizer.zero_grad()
+            sam_first_step_applied = False
+        first_step_scaler.update()
+
+        with autocast():
+            y, f = model(x)
+            y_s, y_t = y.chunk(2, dim=0)
+            f_s, f_t = f.chunk(2, dim=0)
+
+            # 源域分类损失
+            # cls_loss = F.cross_entropy(y_s, labels_s)
+
+            # 源域+目标域分类损失
+            cls_loss = F.cross_entropy(y_s, labels_s) + \
+                torch.mean(pseudo_prob_t* F.cross_entropy(y_t, pseudo_label_t, reduction='none'))
+
+            mcc_loss_value = mcc(y_t)
 
             y_t_masked, f_t_masked = model(x_t_masked)
 
@@ -296,8 +389,14 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
             
             kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
 
+            domain_loss = domain_adv(y_s, f_s, y_t, f_t)
+            domain_acc = domain_adv.domain_discriminator_accuracy
+
             # 总损失
-            loss = cls_loss + 10*kd_loss + masking_loss_value
+            loss = cls_loss + 10*kd_loss + masking_loss_value + mcc_loss_value + domain_loss
+            # loss = cls_loss + 10*kd_loss + masking_loss_value + domain_loss
+
+
 
         cls_acc = accuracy(y_s, labels_s)[0]
         if args.log_results:
@@ -315,17 +414,30 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
         mask_losses.update(masking_loss_value.item(), x_s.size(0))
         kd_losses.update(kd_loss.item(), x_s.size(0))
+        domain_accs.update(domain_acc, x_s.size(0))
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        # scaler.scale(loss).backward()
+        # scaler.unscale_(optimizer)
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
+        # scaler.step(optimizer)
+        # scaler.update()
+
+        second_step_scaler.scale(loss).backward()
+        second_step_scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
-        scaler.step(optimizer)
-        scaler.update()
+        if sam_first_step_applied:
+            optimizer.second_step()
+        second_step_scaler.step(optimizer)
+        second_step_scaler.step(ad_optimizer)
+        second_step_scaler.update()
+
+        lr_scheduler.step()
+        lr_scheduler_ad.step()
 
         # 更新原型，按照论文代码，使用的是teacher的输出
         teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
 
-        lr_scheduler.step()
+        # lr_scheduler.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
