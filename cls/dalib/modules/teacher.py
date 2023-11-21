@@ -50,14 +50,14 @@ class EMATeacher(nn.Module):
             self._update_ema(model, iter)
 
     @torch.no_grad()
-    def forward(self, target_img):
+    def forward(self, target_img, output_feat = False):
         # Generate pseudo-label
         for m in self.ema_model.modules():
             if isinstance(m, _DropoutNd):
                 m.training = False
             if isinstance(m, DropPath):
                 m.training = False
-        logits, _ = self.ema_model(target_img)
+        logits, features = self.ema_model(target_img)
 
         ema_softmax = torch.softmax(logits.detach(), dim=1)
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
@@ -69,7 +69,10 @@ class EMATeacher(nn.Module):
         else:
             raise NotImplementedError(self.pseudo_label_weight)
 
-        return pseudo_label, pseudo_weight, ema_softmax
+        if output_feat:
+            return pseudo_label, pseudo_weight, ema_softmax, features
+        else:
+            return pseudo_label, pseudo_weight, ema_softmax
     
 class EMATeacherPrototype(nn.Module):
 

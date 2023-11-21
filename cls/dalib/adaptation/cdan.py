@@ -164,12 +164,14 @@ class MultiLinearMap(nn.Module):
 
 
 class ImageClassifier(ClassifierBase):
-    def __init__(self, backbone: nn.Module, num_classes: int, bottleneck_dim: Optional[int] = 256, **kwargs):
+    def __init__(self, backbone: nn.Module, num_classes: int, bottleneck_dim: Optional[int] = 256, relu = True, **kwargs):
         bottleneck = nn.Sequential(
             # nn.AdaptiveAvgPool2d(output_size=(1, 1)),
             # nn.Flatten(),
             nn.Linear(backbone.out_features, bottleneck_dim),
             nn.BatchNorm1d(bottleneck_dim),
-            nn.ReLU()
+            # nn.ReLU()
         )
+        if relu:
+            bottleneck.add_module(nn.ReLU())
         super(ImageClassifier, self).__init__(backbone, num_classes, bottleneck, bottleneck_dim, **kwargs)
