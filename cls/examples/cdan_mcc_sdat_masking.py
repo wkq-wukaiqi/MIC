@@ -44,7 +44,6 @@ def normalize(x, axis=-1):
     x = 1. * x / (torch.norm(x, 2, axis, keepdim=True).expand_as(x) + 1e-12)
     return x
 
-
 def euclidean_dist(x, y):
     """
     Args:
@@ -62,6 +61,26 @@ def euclidean_dist(x, y):
     dist.addmm_(x, y.t(), beta=1, alpha=-2)
     dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
     return dist
+
+def cosine_dist(x, y):
+	bs1, bs2 = x.size(0), y.size(0)
+	frac_up = torch.matmul(x, y.transpose(0, 1))
+	frac_down = (torch.sqrt(torch.sum(torch.pow(x, 2), 1))).view(bs1, 1).repeat(1, bs2) * \
+	            (torch.sqrt(torch.sum(torch.pow(y, 2), 1))).view(1, bs2).repeat(bs1, 1)
+	cosine = frac_up / frac_down
+	return 1-cosine
+
+def _batch_hard(mat_distance, mat_similarity, indice=False):
+	sorted_mat_distance, positive_indices = torch.sort(mat_distance + (-9999999.) * (1 - mat_similarity), dim=1, descending=True)
+	hard_p = sorted_mat_distance[:, 0]
+	hard_p_indice = positive_indices[:, 0]
+	sorted_mat_distance, negative_indices = torch.sort(mat_distance + (9999999.) * (mat_similarity), dim=1, descending=False)
+	hard_n = sorted_mat_distance[:, 0]
+	hard_n_indice = negative_indices[:, 0]
+	if(indice):
+		return hard_p, hard_n, hard_p_indice, hard_n_indice
+	return hard_p, hard_n
+
 
 def hard_example_mining(dist_mat, labels, return_inds=False):
     """For each anchor, find the hardest positive and negative sample.
@@ -132,6 +151,9 @@ class TripletLoss(object):
             self.ranking_loss = nn.SoftMarginLoss()
 
     def __call__(self, feat, labels, normalize_feature=False):
+        # indexs = (labels != 5004).nonzero().view(-1)
+        # global_feat = global_feat[indexs].contiguous()
+        # labels = labels[indexs].contiguous()
         if normalize_feature:
             feat = normalize(feat, axis=-1)
         if len(feat.size()) == 3:
@@ -146,6 +168,41 @@ class TripletLoss(object):
         else:
             loss = self.ranking_loss(dist_an - dist_ap, y)
         return loss
+
+class SoftTripletLoss(nn.Module):
+
+	def __init__(self, margin=None, normalize_feature=False):
+		super(SoftTripletLoss, self).__init__()
+		self.margin = margin
+		self.normalize_feature = normalize_feature
+
+	def forward(self, emb1, emb2, label):
+		if self.normalize_feature:
+			# equal to cosine similarity
+			emb1 = F.normalize(emb1)
+			emb2 = F.normalize(emb2)
+
+		mat_dist = euclidean_dist(emb1, emb1)
+		assert mat_dist.size(0) == mat_dist.size(1)
+		N = mat_dist.size(0)
+		mat_sim = label.expand(N, N).eq(label.expand(N, N).t()).float()
+
+		dist_ap, dist_an, ap_idx, an_idx = _batch_hard(mat_dist, mat_sim, indice=True)
+		assert dist_an.size(0)==dist_ap.size(0)
+		triple_dist = torch.stack((dist_ap, dist_an), dim=1)
+		triple_dist = F.log_softmax(triple_dist, dim=1)
+		if (self.margin is not None):
+			loss = (- self.margin * triple_dist[:,0] - (1 - self.margin) * triple_dist[:,1]).mean()
+			return loss
+
+		mat_dist_ref = euclidean_dist(emb2, emb2)
+		dist_ap_ref = torch.gather(mat_dist_ref, 1, ap_idx.view(N,1).expand(N,N))[:,0]
+		dist_an_ref = torch.gather(mat_dist_ref, 1, an_idx.view(N,1).expand(N,N))[:,0]
+		triple_dist_ref = torch.stack((dist_ap_ref, dist_an_ref), dim=1)
+		triple_dist_ref = F.softmax(triple_dist_ref, dim=1).detach()
+
+		loss = (- triple_dist_ref * triple_dist).mean(0).sum()
+		return loss
 
 
 
@@ -243,7 +300,7 @@ def main(args: argparse.Namespace):
 
     mcc_loss = MinimumClassConfusionLoss(temperature=args.temperature)
 
-    triplet_loss=TripletLoss(margin=0.3)
+    triplet_loss=SoftTripletLoss(margin=0.3)
 
     masking_t = Masking(
         block_size=args.mask_block_size,
@@ -409,7 +466,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
         # teacher.module.update_weights(model, epoch * args.iters_per_epoch + i)
         if teacher is not None:
             teacher.update_weights(model, epoch * args.iters_per_epoch + i)
-            pseudo_label_t, pseudo_prob_t, ema_softmax  = teacher(x_t)
+            pseudo_label_t, pseudo_prob_t, ema_softmax, features_teacher  = teacher(x_t)
             pseudo_label_acc, = accuracy(ema_softmax, labels_t, topk=(1,))
 
         # compute output
@@ -429,7 +486,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             # masking_loss_value就是所谓的 MIC loss
             if teacher is not None:
                 # 5轮后才加入teacher
-                y_t_masked, _ = model(x_t_masked)
+                y_t_masked, f_t_masked = model(x_t_masked)
                 if teacher.pseudo_label_weight is not None:
                     ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
                     masking_loss_value = torch.mean(pseudo_prob_t * ce)
@@ -441,7 +498,9 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             else:
                 loss = cls_loss + mcc_loss_value
             if args.triplet:
-                triplet_loss_value = triplet_loss(f_s, labels_s) + triplet_loss(f_t, pseudo_label_t)
+                # triplet_loss_value = triplet_loss(f_s, labels_s) + triplet_loss(f_t, pseudo_label_t)
+                triplet_loss_value = triplet_loss(f_s.detach(), f_s.detach(), labels_s) + \
+                triplet_loss(f_t_masked.detach(), features_teacher, pseudo_label_t) 
                 loss = loss + triplet_loss_value
 
         first_step_scaler.scale(loss).backward()
@@ -483,7 +542,9 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             # 还有一个ConditionalDomainAdversarialLoss，即CDAN，这也是SDAT的一个组成部分
             # 简单来说就是一个对抗训练，用于提取域不变特征
             if args.triplet:
-                triplet_loss_value = triplet_loss(f_s, labels_s) + triplet_loss(f_t, pseudo_label_t)
+                # triplet_loss_value = triplet_loss(f_s, labels_s) + triplet_loss(f_t, pseudo_label_t)
+                triplet_loss_value = triplet_loss(f_s.detach(), f_s.detach(), labels_s) + \
+                triplet_loss(f_t_masked.detach(), features_teacher, pseudo_label_t) 
                 loss = triplet_loss_value + cls_loss + transfer_loss * args.trade_off
             else:
                 loss = cls_loss + transfer_loss * args.trade_off            

@@ -57,7 +57,7 @@ class EMATeacher(nn.Module):
                 m.training = False
             if isinstance(m, DropPath):
                 m.training = False
-        logits, _ = self.ema_model(target_img)
+        logits, features = self.ema_model(target_img)
 
         ema_softmax = torch.softmax(logits.detach(), dim=1)
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
@@ -69,7 +69,7 @@ class EMATeacher(nn.Module):
         else:
             raise NotImplementedError(self.pseudo_label_weight)
 
-        return pseudo_label, pseudo_weight, ema_softmax
+        return pseudo_label, pseudo_weight, ema_softmax, features
     
 class EMATeacherPrototype(nn.Module):
 
