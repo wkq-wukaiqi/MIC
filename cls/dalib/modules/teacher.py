@@ -99,7 +99,7 @@ class EMATeacherPrototype(nn.Module):
 
         self.init_mode = False
         self.len_dataset = 0
-        self.confidence_count = [0 for _ in range(12)]
+        self.confidence_count = [0 for _ in range(self.num_classes)]
 
     def _init_ema_weights(self, model):
         for param in self.ema_model.parameters():
@@ -171,7 +171,8 @@ class EMATeacherPrototype(nn.Module):
         # ProDA的不同点是在这里给ema_softmax乘上了一个权重w，然后再做argmax产生硬伪标签
         ema_softmax = ema_softmax * w
         # bf = 0.5
-        # entropy = (-ema_softmax*torch.log(ema_softmax)).sum()/ema_softmax.size(0)
+        # 单个样本softmax的熵值
+        # entropy = torch.sum((-ema_softmax*torch.log(ema_softmax)), dim=1, keepdim=True)
         # bf = 0.5 * torch.exp(-entropy)
         # ema_softmax = ema_softmax * bf + w * (1 - bf)
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
