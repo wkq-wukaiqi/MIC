@@ -191,7 +191,7 @@ def main(args: argparse.Namespace):
     backbone = utils.get_model(args.arch, pretrain=not args.scratch)
     # print(backbone)
     pool_layer = nn.Identity() if args.no_pool else None
-    classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim, relu=False,
+    classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim,
                                  pool_layer=pool_layer, finetune=not args.scratch).to(device)
     classifier_feature_dim = classifier.features_dim
 

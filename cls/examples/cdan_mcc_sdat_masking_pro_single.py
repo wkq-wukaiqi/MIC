@@ -35,6 +35,100 @@ from common.utils.sam import SAM
 sys.path.append('.')
 import utils
 
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
+    It also supports the unsupervised contrastive loss in SimCLR"""
+    def __init__(self, temperature=0.07, contrast_mode='all',
+                 base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None, weights=None):
+        """Compute loss for model. If both `labels` and `mask` are None,
+        it degenerates to SimCLR unsupervised loss:
+        https://arxiv.org/pdf/2002.05709.pdf
+
+        Args:
+            features: hidden vector of shape [bsz, n_views, ...].
+            labels: ground truth of shape [bsz].
+            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
+                has the same class as sample i. Can be asymmetric.
+        Returns:
+            A loss scalar.
+        """
+        device = (torch.device('cuda')
+                  if features.is_cuda
+                  else torch.device('cpu'))
+
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...],'
+                             'at least 3 dimensions are required')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+
+        if weights is not None:
+            loss = (loss.view(anchor_count, batch_size) * weights).sum() / weights.sum()
+        else:
+            loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
+
 def main(args: argparse.Namespace):
     assert args.resume_path is not None, 'baseline checkpoint required!'
 
@@ -102,6 +196,7 @@ def main(args: argparse.Namespace):
     pool_layer = nn.Identity() if args.no_pool else None
     classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim,
                                  pool_layer=pool_layer, finetune=not args.scratch).to(device)
+    classifier_feature_dim = classifier.features_dim
 
     # 加载classifier的baseline模型
     baseline_dict = torch.load(args.resume_path)
@@ -113,13 +208,33 @@ def main(args: argparse.Namespace):
                                   threshold=args.pseudo_threshold).to(device)
     init_teacher(teacher, val_loader, device)
 
+    if args.randomized:
+        domain_discri = DomainDiscriminator(
+            args.randomized_dim, hidden_size=1024).to(device)
+    else:
+        domain_discri = DomainDiscriminator(
+            classifier_feature_dim * num_classes, hidden_size=1024).to(device)
+
     # define optimizer and lr scheduler
+    ad_optimizer = SGD(domain_discri.get_parameters(
+    ), args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     optimizer = torch.optim.SGD(classifier.get_parameters(), 
                                      lr=args.lr, 
                                      momentum=args.momentum, 
                                      weight_decay=args.weight_decay)
     lr_scheduler = LambdaLR(optimizer, lambda x: args.lr *
                             (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
+    lr_scheduler_ad = LambdaLR(
+        ad_optimizer, lambda x: args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
+
+    # define loss function
+    domain_adv = ConditionalDomainAdversarialLoss(
+        domain_discri, entropy_conditioning=args.entropy,
+        num_classes=num_classes, features_dim=classifier_feature_dim, randomized=args.randomized,
+        randomized_dim=args.randomized_dim
+    ).to(device)
+    
+    contrastive_loss = SupConLoss(contrast_mode='one')
     
     masking_t = Masking(
         block_size=args.mask_block_size,
@@ -141,6 +256,10 @@ def main(args: argparse.Namespace):
         std=args.norm_std)
     else:
         masking_s = None
+
+    print("validate baseline model")
+    acc1 = utils.validate(test_loader, classifier, args, device)
+    print("test_acc1 = {:3.1f}".format(acc1))
 
     # start training
     best_acc1 = 0.
@@ -165,8 +284,8 @@ def main(args: argparse.Namespace):
             masking_t.update_ratio(ratio)
 
         # train for one epoch
-        train(scaler, train_source_iter, train_target_iter, classifier, teacher,
-              masking_t, masking_s, optimizer, lr_scheduler, epoch, args)
+        train(scaler, train_source_iter, train_target_iter, classifier, teacher, domain_adv, contrastive_loss,
+              masking_t, masking_s, optimizer, ad_optimizer, lr_scheduler, lr_scheduler_ad, epoch, args)
         
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
@@ -213,16 +332,19 @@ def init_teacher(teacher, val_loader, device):
 
 
 def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
-          model: ImageClassifier, teacher: EMATeacherPrototype,
-          masking_t, masking_s, optimizer, lr_scheduler: LambdaLR,
+          model: ImageClassifier, teacher: EMATeacherPrototype, domain_adv: ConditionalDomainAdversarialLoss,
+          contrastive_loss,
+          masking_t, masking_s, optimizer, ad_optimizer, lr_scheduler: LambdaLR, lr_scheduler_ad,
           epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':3.1f')
     data_time = AverageMeter('Data', ':3.1f')
     losses = AverageMeter('Loss', ':3.3f')
     cls_losses = AverageMeter('Cls Loss', ':3.3f')
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
+    domain_accs = AverageMeter('Domain Acc', ':3.1f')
     mask_losses = AverageMeter('Mask Loss', ':3.3f')
     kd_losses = AverageMeter('KD Loss', ':3.3f')
+    contrastive_losses = AverageMeter('Contrastive Loss', ':3.3f')
     pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
     log_list = [batch_time, 
                 data_time, 
@@ -230,7 +352,9 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
                 cls_losses, 
                 mask_losses, 
                 kd_losses,
+                contrastive_losses,
                 pseudo_label_accs,
+                domain_accs,
                 cls_accs]
 
     progress = ProgressMeter(
@@ -240,6 +364,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
     # switch to train mode
     model.train()
+    domain_adv.train()
 
     end = time.time()
     for i in range(args.iters_per_epoch):
@@ -261,6 +386,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         # measure data loading time
         data_time.update(time.time() - end)
         optimizer.zero_grad()
+        ad_optimizer.zero_grad()
 
         # generate pseudo-label
         teacher.update_weights(model, epoch * args.iters_per_epoch + i)
@@ -288,16 +414,19 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
             # 一致性KL散度损失
             teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
-            # student_distance = torch.cdist(f_t, teacher.prototypes.detach(), p=2)
             student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
-            
-            # kd_loss = F.kl_div(F.log_softmax(-student_distance, dim=1), F.softmax(-teacher_distance.detach(), dim=1)) + \
-            #           F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
             
             kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
 
+            features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
+            contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
+
+            # 域对抗损失
+            domain_loss = domain_adv(y_s, f_s, y_t, f_t)
+            domain_acc = domain_adv.domain_discriminator_accuracy
+
             # 总损失
-            loss = cls_loss + 10*kd_loss + masking_loss_value
+            loss = cls_loss + 10*kd_loss + masking_loss_value + contrastive_loss_value + domain_loss
 
         cls_acc = accuracy(y_s, labels_s)[0]
         if args.log_results:
@@ -315,17 +444,21 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
         mask_losses.update(masking_loss_value.item(), x_s.size(0))
         kd_losses.update(kd_loss.item(), x_s.size(0))
+        contrastive_losses.update(contrastive_loss_value.item(), x_s.size(0))
+        domain_accs.update(domain_acc, x_s.size(0))
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
         scaler.step(optimizer)
+        scaler.step(ad_optimizer)
         scaler.update()
 
         # 更新原型，按照论文代码，使用的是teacher的输出
         teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
 
         lr_scheduler.step()
+        lr_scheduler_ad.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)

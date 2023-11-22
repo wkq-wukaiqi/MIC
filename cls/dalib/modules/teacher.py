@@ -161,8 +161,19 @@ class EMATeacherPrototype(nn.Module):
         distances = distances - nearest_distance
         w = F.softmax(-distances, dim=1)
 
+        # pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
+        # low_confidence_idx = torch.nonzero(pseudo_prob < self.threshold).squeeze()
+        # if low_confidence_idx.size() != torch.Size([0]):
+        #     print('confusing:',ema_softmax[low_confidence_idx])
+        #     print('w',w[low_confidence_idx])
+        #     print('new softmax',(ema_softmax*w)[low_confidence_idx])
+
         # ProDA的不同点是在这里给ema_softmax乘上了一个权重w，然后再做argmax产生硬伪标签
         ema_softmax = ema_softmax * w
+        # bf = 0.5
+        # entropy = (-ema_softmax*torch.log(ema_softmax)).sum()/ema_softmax.size(0)
+        # bf = 0.5 * torch.exp(-entropy)
+        # ema_softmax = ema_softmax * bf + w * (1 - bf)
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
 
         return pseudo_prob, pseudo_label, ema_softmax, features
@@ -195,7 +206,13 @@ class EMATeacherPrototype(nn.Module):
 
         high_confidence_idx = torch.nonzero(pseudo_prob > self.threshold).squeeze()
 
-        return len(high_confidence_idx)
+        if high_confidence_idx.size() == torch.Size([]):
+            high_confidence_idx = high_confidence_idx.unsqueeze(0)
+
+        if high_confidence_idx.size() != torch.Size([0]):
+            return len(high_confidence_idx)
+        else:
+            return 0
 
     @torch.no_grad()
     def update_prototypes(self, features, pseudo_prob, pseudo_label):
@@ -205,6 +222,7 @@ class EMATeacherPrototype(nn.Module):
         else:
             # 更新时全用
             high_confidence_idx = torch.nonzero(pseudo_prob > 0).squeeze()
+            # features = features * pseudo_prob.unsqueeze(-1)
         # high_confidence_idx = torch.nonzero(pseudo_prob > self.threshold).squeeze()
         
         if high_confidence_idx.size() != torch.Size([0]):
