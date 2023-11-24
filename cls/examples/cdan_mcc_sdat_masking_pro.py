@@ -213,7 +213,7 @@ def main(args: argparse.Namespace):
                                   alpha=args.alpha, 
                                   pseudo_label_weight=args.pseudo_label_weight,
                                   threshold=args.pseudo_threshold).to(device)
-    init_teacher(teacher, val_loader, device)
+    init_teacher(teacher, train_source_loader,  train_target_loader, device)
 
     # define optimizer and lr scheduler
     # optimizer = torch.optim.SGD(classifier.get_parameters(), 
@@ -316,19 +316,29 @@ def main(args: argparse.Namespace):
 
     logger.close()
 
-def init_teacher(teacher, val_loader, device):
+def init_teacher(teacher, train_loader, val_loader, device):
     """
     初始化teacher，计算原型
     """
     loop = tqdm(enumerate(val_loader), total=len(val_loader))
     loop.set_description(f'Initializing Teacher...')
     teacher.init_begin()
+
     pseudo_label_usages = AverageMeter('Pseudo Usage', ':3.3f')
     with torch.no_grad():
         for _, (images, _) in loop:
             images = images.to(device)
             pseudo_label_usage = teacher.init_prototypes(images)
             pseudo_label_usages.update(pseudo_label_usage / images.size(0), images.size(0))
+
+    loop = tqdm(enumerate(train_loader), total=len(train_loader))
+    pseudo_label_usages = AverageMeter('Pseudo Usage', ':3.3f')
+    with torch.no_grad():
+        for _, (images, _) in loop:
+            images = images.to(device)
+            pseudo_label_usage = teacher.init_prototypes(images)
+            pseudo_label_usages.update(pseudo_label_usage / images.size(0), images.size(0))
+
     teacher.init_end()
     print(f'Pseudo Label Usage: {100*pseudo_label_usages.avg:.2f}%')
 
@@ -344,7 +354,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
     mask_losses = AverageMeter('Mask Loss', ':3.3f')
     kd_losses = AverageMeter('KD Loss', ':3.3f')
-    contrastive_losses = AverageMeter('Contrastive Loss', ':3.3f')
+    # contrastive_losses = AverageMeter('Contrastive Loss', ':3.3f')
     domain_accs = AverageMeter('Domain Acc', ':3.1f')
     pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
     log_list = [batch_time, 
@@ -353,7 +363,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
                 cls_losses, 
                 mask_losses, 
                 kd_losses,
-                contrastive_losses,
+                # contrastive_losses,
                 domain_accs,
                 pseudo_label_accs,
                 cls_accs]
@@ -408,7 +418,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             # cls_loss = F.cross_entropy(y_s, labels_s) + \
             #     torch.mean(pseudo_prob_t* F.cross_entropy(y_t, pseudo_label_t, reduction='none'))
 
-            mcc_loss_value = mcc(y_t)
+            # mcc_loss_value = mcc(y_t)
 
             y_t_masked, f_t_masked = model(x_t_masked)
 
@@ -431,8 +441,8 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
 
             # 总损失
-            loss = cls_loss + 10*kd_loss + masking_loss_value + mcc_loss_value
-            # loss = cls_loss + 10*kd_loss + masking_loss_value
+            # loss = cls_loss + 10*kd_loss + masking_loss_value + mcc_loss_value
+            loss = cls_loss + 10*kd_loss + masking_loss_value
 
         first_step_scaler.scale(loss).backward()
         first_step_scaler.unscale_(optimizer)
@@ -460,13 +470,13 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             f_s, f_t = f.chunk(2, dim=0)
 
             # 源域分类损失
-            # cls_loss = F.cross_entropy(y_s, labels_s)
+            cls_loss = F.cross_entropy(y_s, labels_s)
 
             # 源域+目标域分类损失
-            cls_loss = F.cross_entropy(y_s, labels_s) + \
-                torch.mean(pseudo_prob_t* F.cross_entropy(y_t, pseudo_label_t, reduction='none'))
+            # cls_loss = F.cross_entropy(y_s, labels_s) + \
+            #     torch.mean(pseudo_prob_t* F.cross_entropy(y_t, pseudo_label_t, reduction='none'))
 
-            mcc_loss_value = mcc(y_t)
+            # mcc_loss_value = mcc(y_t)
 
             y_t_masked, f_t_masked = model(x_t_masked)
 
@@ -485,17 +495,17 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             # kd_loss = F.kl_div(F.log_softmax(-student_distance, dim=1), F.softmax(-teacher_distance.detach(), dim=1)) + \
             #           F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
             
-            kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
+            kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance, dim=1))
 
             domain_loss = domain_adv(y_s, f_s, y_t, f_t)
             domain_acc = domain_adv.domain_discriminator_accuracy
 
-            features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
-            contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
+            # features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
+            # contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
 
             # 总损失
-            loss = cls_loss + 10*kd_loss + masking_loss_value + mcc_loss_value + domain_loss + contrastive_loss_value
-            # loss = cls_loss + 10*kd_loss + masking_loss_value + domain_loss
+            # loss = cls_loss + 10*kd_loss + masking_loss_value + mcc_loss_value + domain_loss + contrastive_loss_value
+            loss = cls_loss + 10*kd_loss + masking_loss_value + domain_loss
 
 
 
@@ -515,7 +525,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
         pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
         mask_losses.update(masking_loss_value.item(), x_s.size(0))
         kd_losses.update(kd_loss.item(), x_s.size(0))
-        contrastive_losses.update(contrastive_loss_value.item(), x_s.size(0))
+        # contrastive_losses.update(contrastive_loss_value.item(), x_s.size(0))
         domain_accs.update(domain_acc, x_s.size(0))
 
         # scaler.scale(loss).backward()
@@ -538,6 +548,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
 
         # 更新原型，按照论文代码，使用的是teacher的输出
         teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
+        teacher.update_prototypes(f_s.detach(), torch.ones(pseudo_prob_t.shape, device=pseudo_prob_t.device), labels_s)
 
         # lr_scheduler.step()
 

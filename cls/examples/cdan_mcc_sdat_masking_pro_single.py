@@ -206,7 +206,7 @@ def main(args: argparse.Namespace):
                                   alpha=args.alpha, 
                                   pseudo_label_weight=args.pseudo_label_weight,
                                   threshold=args.pseudo_threshold).to(device)
-    init_teacher(teacher, val_loader, device)
+    init_teacher(teacher, train_source_loader,  train_target_loader, device)
 
     if args.randomized:
         domain_discri = DomainDiscriminator(
@@ -257,9 +257,9 @@ def main(args: argparse.Namespace):
     else:
         masking_s = None
 
-    print("validate baseline model")
-    acc1 = utils.validate(test_loader, classifier, args, device)
-    print("test_acc1 = {:3.1f}".format(acc1))
+    # print("validate baseline model")
+    # acc1 = utils.validate(test_loader, classifier, args, device)
+    # print("test_acc1 = {:3.1f}".format(acc1))
 
     # start training
     best_acc1 = 0.
@@ -314,19 +314,29 @@ def main(args: argparse.Namespace):
 
     logger.close()
 
-def init_teacher(teacher, val_loader, device):
+def init_teacher(teacher, train_loader, val_loader, device):
     """
     初始化teacher，计算原型
     """
     loop = tqdm(enumerate(val_loader), total=len(val_loader))
     loop.set_description(f'Initializing Teacher...')
     teacher.init_begin()
+
     pseudo_label_usages = AverageMeter('Pseudo Usage', ':3.3f')
     with torch.no_grad():
         for _, (images, _) in loop:
             images = images.to(device)
             pseudo_label_usage = teacher.init_prototypes(images)
             pseudo_label_usages.update(pseudo_label_usage / images.size(0), images.size(0))
+
+    # loop = tqdm(enumerate(train_loader), total=len(train_loader))
+    # pseudo_label_usages = AverageMeter('Pseudo Usage', ':3.3f')
+    # with torch.no_grad():
+    #     for _, (images, _) in loop:
+    #         images = images.to(device)
+    #         pseudo_label_usage = teacher.init_prototypes(images)
+    #         pseudo_label_usages.update(pseudo_label_usage / images.size(0), images.size(0))
+
     teacher.init_end()
     print(f'Pseudo Label Usage: {100*pseudo_label_usages.avg:.2f}%')
 
@@ -344,7 +354,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
     domain_accs = AverageMeter('Domain Acc', ':3.1f')
     mask_losses = AverageMeter('Mask Loss', ':3.3f')
     kd_losses = AverageMeter('KD Loss', ':3.3f')
-    contrastive_losses = AverageMeter('Contrastive Loss', ':3.3f')
+    # contrastive_losses = AverageMeter('Contrastive Loss', ':3.3f')
     pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
     log_list = [batch_time, 
                 data_time, 
@@ -352,7 +362,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
                 cls_losses, 
                 mask_losses, 
                 kd_losses,
-                contrastive_losses,
+                # contrastive_losses,
                 pseudo_label_accs,
                 domain_accs,
                 cls_accs]
@@ -413,20 +423,25 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
                 masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
 
             # 一致性KL散度损失
-            teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
-            student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
+            teacher_distance = torch.cdist(features_teacher, teacher.prototypes, p=2)
+            student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes, p=2)
+            # student_distance_source = torch.cdist(f_s, teacher.prototypes, p=2)
             
-            kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
+            # kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance, dim=1)) + \
+            #     F.kl_div(F.log_softmax(-student_distance_source, dim=1), F.softmax(-teacher_distance, dim=1))
+            
+            kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance, dim=1))
 
-            features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
-            contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
+            # features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
+            # contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
 
             # 域对抗损失
             domain_loss = domain_adv(y_s, f_s, y_t, f_t)
             domain_acc = domain_adv.domain_discriminator_accuracy
 
             # 总损失
-            loss = cls_loss + 10*kd_loss + masking_loss_value + contrastive_loss_value + domain_loss
+            # loss = cls_loss + 10*kd_loss + masking_loss_value + contrastive_loss_value + domain_loss
+            loss = cls_loss + 10*kd_loss + masking_loss_value + domain_loss
 
         cls_acc = accuracy(y_s, labels_s)[0]
         if args.log_results:
@@ -444,7 +459,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
         mask_losses.update(masking_loss_value.item(), x_s.size(0))
         kd_losses.update(kd_loss.item(), x_s.size(0))
-        contrastive_losses.update(contrastive_loss_value.item(), x_s.size(0))
+        # contrastive_losses.update(contrastive_loss_value.item(), x_s.size(0))
         domain_accs.update(domain_acc, x_s.size(0))
 
         scaler.scale(loss).backward()
@@ -456,6 +471,7 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
         # 更新原型，按照论文代码，使用的是teacher的输出
         teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
+        # teacher.update_prototypes(f_s.detach(), torch.ones(pseudo_prob_t.shape, device=pseudo_prob_t.device), labels_s)
 
         lr_scheduler.step()
         lr_scheduler_ad.step()
