@@ -76,7 +76,7 @@ class EMATeacher(nn.Module):
     
 class EMATeacherPrototype(nn.Module):
 
-    def __init__(self, model, alpha, pseudo_label_weight, threshold):
+    def __init__(self, model, alpha, pseudo_label_weight, threshold, momentum=0.9, use_bf=False):
         super(EMATeacherPrototype, self).__init__()
         self.ema_model = deepcopy(model)
         # 按照ProDA论文，softmax软标签是固定的
@@ -95,7 +95,8 @@ class EMATeacherPrototype(nn.Module):
             torch.zeros((self.num_classes, self.features_dim)),
             requires_grad=False
         )
-        self.momentum = 0.9
+        self.momentum = momentum
+        self.use_bf = use_bf
 
         self.init_mode = False
         self.len_dataset = 0
@@ -161,20 +162,15 @@ class EMATeacherPrototype(nn.Module):
         distances = distances - nearest_distance
         w = F.softmax(-distances, dim=1)
 
-        # pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
-        # low_confidence_idx = torch.nonzero(pseudo_prob < self.threshold).squeeze()
-        # if low_confidence_idx.size() != torch.Size([0]):
-        #     print('confusing:',ema_softmax[low_confidence_idx])
-        #     print('w',w[low_confidence_idx])
-        #     print('new softmax',(ema_softmax*w)[low_confidence_idx])
-
-        # ProDA的不同点是在这里给ema_softmax乘上了一个权重w，然后再做argmax产生硬伪标签
-        ema_softmax = ema_softmax * w
-        # bf = 0.5
-        # 单个样本softmax的熵值
-        # entropy = torch.sum((-ema_softmax*torch.log(ema_softmax)), dim=1, keepdim=True)
-        # bf = 0.5 * torch.exp(-entropy)
-        # ema_softmax = ema_softmax * bf + w * (1 - bf)
+        if self.use_bf:
+            # 单个样本softmax的熵值
+            entropy = torch.sum((-ema_softmax*torch.log(ema_softmax)), dim=1, keepdim=True)
+            bf = torch.exp(-entropy)
+            ema_softmax = ema_softmax * bf + w * (1 - bf)
+        else:
+            # ProDA的不同点是在这里给ema_softmax乘上了一个权重w，然后再做argmax产生硬伪标签
+            ema_softmax = ema_softmax * w
+        
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
 
         return pseudo_prob, pseudo_label, ema_softmax, features

@@ -182,9 +182,9 @@ def main(args: argparse.Namespace):
     train_target_loader = DataLoader(train_target_dataset, batch_size=args.batch_size,
                                      shuffle=True, num_workers=args.workers, drop_last=True)
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size*4, shuffle=False, num_workers=args.workers)
+        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size*4, shuffle=False, num_workers=args.workers)
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
 
     train_source_iter = ForeverDataIterator(train_source_loader)
     train_target_iter = ForeverDataIterator(train_target_loader)
@@ -205,8 +205,10 @@ def main(args: argparse.Namespace):
     teacher = EMATeacherPrototype(classifier, 
                                   alpha=args.alpha, 
                                   pseudo_label_weight=args.pseudo_label_weight,
-                                  threshold=args.pseudo_threshold).to(device)
-    init_teacher(teacher, train_source_loader,  train_target_loader, device)
+                                  threshold=args.pseudo_threshold,
+                                  momentum=args.prototype_m,
+                                  use_bf=args.use_bf).to(device)
+    init_teacher(teacher, train_target_loader, device)
 
     if args.randomized:
         domain_discri = DomainDiscriminator(
@@ -314,11 +316,11 @@ def main(args: argparse.Namespace):
 
     logger.close()
 
-def init_teacher(teacher, train_loader, val_loader, device):
+def init_teacher(teacher, train_target_loader, device):
     """
     初始化teacher，计算原型
     """
-    loop = tqdm(enumerate(val_loader), total=len(val_loader))
+    loop = tqdm(enumerate(train_target_loader), total=len(train_target_loader))
     loop.set_description(f'Initializing Teacher...')
     teacher.init_begin()
 
@@ -328,15 +330,6 @@ def init_teacher(teacher, train_loader, val_loader, device):
             images = images.to(device)
             pseudo_label_usage = teacher.init_prototypes(images)
             pseudo_label_usages.update(pseudo_label_usage / images.size(0), images.size(0))
-
-    # loop = tqdm(enumerate(train_loader), total=len(train_loader))
-    # pseudo_label_usages = AverageMeter('Pseudo Usage', ':3.3f')
-    # with torch.no_grad():
-    #     for _, (images, _) in loop:
-    #         images = images.to(device)
-    #         pseudo_label_usage = teacher.init_prototypes(images)
-    #         pseudo_label_usages.update(pseudo_label_usage / images.size(0), images.size(0))
-
     teacher.init_end()
     print(f'Pseudo Label Usage: {100*pseudo_label_usages.avg:.2f}%')
 
@@ -351,22 +344,25 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
     losses = AverageMeter('Loss', ':3.3f')
     cls_losses = AverageMeter('Cls Loss', ':3.3f')
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
-    domain_accs = AverageMeter('Domain Acc', ':3.1f')
     mask_losses = AverageMeter('Mask Loss', ':3.3f')
-    kd_losses = AverageMeter('KD Loss', ':3.3f')
-    # contrastive_losses = AverageMeter('Contrastive Loss', ':3.3f')
     pseudo_label_accs = AverageMeter('Pseudo Label Acc', ':3.1f')
     log_list = [batch_time, 
                 data_time, 
                 losses,
                 cls_losses, 
                 mask_losses, 
-                kd_losses,
-                # contrastive_losses,
                 pseudo_label_accs,
-                domain_accs,
                 cls_accs]
-
+    if args.kd_loss:
+        kd_losses = AverageMeter('KD Loss', ':3.3f')
+        log_list.append(kd_losses)
+    if args.contrastive:
+        contrastive_losses = AverageMeter('Contrastive Loss', ':3.3f')
+        log_list.append(contrastive_losses)
+    if args.domain_adv:
+        domain_accs = AverageMeter('Domain Acc', ':3.1f')
+        log_list.append(domain_accs)
+    
     progress = ProgressMeter(
         args.iters_per_epoch,
         log_list,
@@ -374,7 +370,8 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
 
     # switch to train mode
     model.train()
-    domain_adv.train()
+    if args.domain_adv:
+        domain_adv.train()
 
     end = time.time()
     for i in range(args.iters_per_epoch):
@@ -396,7 +393,8 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         # measure data loading time
         data_time.update(time.time() - end)
         optimizer.zero_grad()
-        ad_optimizer.zero_grad()
+        if args.domain_adv:
+            ad_optimizer.zero_grad()
 
         # generate pseudo-label
         teacher.update_weights(model, epoch * args.iters_per_epoch + i)
@@ -422,26 +420,29 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
             else:
                 masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
 
-            # 一致性KL散度损失
-            teacher_distance = torch.cdist(features_teacher, teacher.prototypes, p=2)
-            student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes, p=2)
-            # student_distance_source = torch.cdist(f_s, teacher.prototypes, p=2)
-            
-            # kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance, dim=1)) + \
-            #     F.kl_div(F.log_softmax(-student_distance_source, dim=1), F.softmax(-teacher_distance, dim=1))
-            
-            kd_loss = F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance, dim=1))
+            loss = cls_loss + masking_loss_value
 
-            # features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
-            # contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
+            if args.kd_loss:
+                # 一致性KL散度损失
+                teacher_distance = torch.cdist(features_teacher, teacher.prototypes, p=2)
+                student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes, p=2)
+                kd_loss = 10*F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance, dim=1))
 
-            # 域对抗损失
-            domain_loss = domain_adv(y_s, f_s, y_t, f_t)
-            domain_acc = domain_adv.domain_discriminator_accuracy
+                loss = loss + kd_loss
 
-            # 总损失
-            # loss = cls_loss + 10*kd_loss + masking_loss_value + contrastive_loss_value + domain_loss
-            loss = cls_loss + 10*kd_loss + masking_loss_value + domain_loss
+            if args.contrastive:
+                # 对比损失
+                features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
+                contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
+
+                loss = loss + contrastive_loss_value
+
+            if args.domain_adv:
+                # 域对抗损失
+                domain_loss = domain_adv(y_s, f_s, y_t, f_t)
+                domain_acc = domain_adv.domain_discriminator_accuracy
+
+                loss = loss + domain_loss
 
         cls_acc = accuracy(y_s, labels_s)[0]
         if args.log_results:
@@ -458,23 +459,27 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         cls_accs.update(cls_acc, x_s.size(0))
         pseudo_label_accs.update(pseudo_label_acc, x_s.size(0))
         mask_losses.update(masking_loss_value.item(), x_s.size(0))
-        kd_losses.update(kd_loss.item(), x_s.size(0))
-        # contrastive_losses.update(contrastive_loss_value.item(), x_s.size(0))
-        domain_accs.update(domain_acc, x_s.size(0))
+        if args.kd_loss:
+            kd_losses.update(kd_loss.item(), x_s.size(0))
+        if args.contrastive:
+            contrastive_losses.update(contrastive_loss_value.item(), x_s.size(0))
+        if args.domain_adv:
+            domain_accs.update(domain_acc, x_s.size(0))
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
         scaler.step(optimizer)
-        scaler.step(ad_optimizer)
+        if args.domain_adv:
+            scaler.step(ad_optimizer)
         scaler.update()
 
         # 更新原型，按照论文代码，使用的是teacher的输出
         teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
-        # teacher.update_prototypes(f_s.detach(), torch.ones(pseudo_prob_t.shape, device=pseudo_prob_t.device), labels_s)
 
         lr_scheduler.step()
-        lr_scheduler_ad.step()
+        if args.domain_adv:
+            lr_scheduler_ad.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -526,7 +531,7 @@ if __name__ == '__main__':
     parser.add_argument('--trade-off', default=1., type=float,
                         help='the trade-off hyper-parameter for transfer loss')
     # training parameters
-    parser.add_argument('-b', '--batch-size', default=16, type=int,
+    parser.add_argument('-b', '--batch-size', default=32, type=int,
                         metavar='N',
                         help='mini-batch size (default: 32)')
     parser.add_argument('--lr', '--learning-rate', default=0.005, type=float,
@@ -586,6 +591,18 @@ if __name__ == '__main__':
     parser.add_argument('--resume_path', default=None, type=str)
     # 伪标签置信度阈值
     parser.add_argument('--pseudo_threshold', default=0.9, type=float)
+    # 是否使用kl散度损失
+    parser.add_argument('--kd_loss', action='store_true')
+    # 是否使用对比损失
+    parser.add_argument('--contrastive', action='store_true')
+    # 是否使用域对抗损失
+    parser.add_argument('--domain_adv', action='store_true')
+    # 原型更新动量
+    parser.add_argument('--prototype_m', default=0.9, type=float)
+    # 是否使用bf修正
+    parser.add_argument('--use_bf', action='store_true')
+
+
 
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [args.gpu]))
