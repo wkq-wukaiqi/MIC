@@ -206,7 +206,6 @@ def main(args: argparse.Namespace):
                                   alpha=args.alpha, 
                                   pseudo_label_weight=args.pseudo_label_weight,
                                   threshold=args.pseudo_threshold,
-                                  momentum=args.prototype_m,
                                   use_bf=args.use_bf).to(device)
     init_teacher(teacher, train_target_loader, device)
 
@@ -259,9 +258,9 @@ def main(args: argparse.Namespace):
     else:
         masking_s = None
 
-    # print("validate baseline model")
-    # acc1 = utils.validate(test_loader, classifier, args, device)
-    # print("test_acc1 = {:3.1f}".format(acc1))
+    print("validate baseline model")
+    acc1 = utils.validate(test_loader, classifier, args, device)
+    print("test_acc1 = {:3.1f}".format(acc1))
 
     # start training
     best_acc1 = 0.
@@ -597,8 +596,6 @@ if __name__ == '__main__':
     parser.add_argument('--contrastive', action='store_true')
     # 是否使用域对抗损失
     parser.add_argument('--domain_adv', action='store_true')
-    # 原型更新动量
-    parser.add_argument('--prototype_m', default=0.9, type=float)
     # 是否使用bf修正
     parser.add_argument('--use_bf', action='store_true')
 

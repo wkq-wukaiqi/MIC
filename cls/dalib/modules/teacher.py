@@ -76,7 +76,7 @@ class EMATeacher(nn.Module):
     
 class EMATeacherPrototype(nn.Module):
 
-    def __init__(self, model, alpha, pseudo_label_weight, threshold, momentum=0.9, use_bf=False):
+    def __init__(self, model, alpha, pseudo_label_weight, threshold, use_bf=False):
         super(EMATeacherPrototype, self).__init__()
         self.ema_model = deepcopy(model)
         # 按照ProDA论文，softmax软标签是固定的
@@ -95,7 +95,7 @@ class EMATeacherPrototype(nn.Module):
             torch.zeros((self.num_classes, self.features_dim)),
             requires_grad=False
         )
-        self.momentum = momentum
+        self.momentum = alpha
         self.use_bf = use_bf
 
         self.init_mode = False
