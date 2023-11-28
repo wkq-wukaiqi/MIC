@@ -76,7 +76,7 @@ class EMATeacher(nn.Module):
     
 class EMATeacherPrototype(nn.Module):
 
-    def __init__(self, model, alpha, pseudo_label_weight, threshold, use_bf=False):
+    def __init__(self, model, alpha, pseudo_label_weight, threshold, fix_label=False):
         super(EMATeacherPrototype, self).__init__()
         self.ema_model = deepcopy(model)
         # 按照ProDA论文，softmax软标签是固定的
@@ -96,7 +96,7 @@ class EMATeacherPrototype(nn.Module):
             requires_grad=False
         )
         self.momentum = alpha
-        self.use_bf = use_bf
+        self.fix_label = fix_label
 
         self.init_mode = False
         self.len_dataset = 0
@@ -155,21 +155,14 @@ class EMATeacherPrototype(nn.Module):
         # logits, features = self.ema_model(target_img)
         ema_softmax = torch.softmax(logits.detach(), dim=1)
 
-        # 计算w
-        distances = torch.cdist(features, self.prototypes, p=2)
-        # 文中公式没写，开源代码里写了还要减去最小距离
-        nearest_distance, _ = distances.min(dim=1, keepdim=True)
-        distances = distances - nearest_distance
-        w = F.softmax(-distances, dim=1)
-
-        if self.use_bf:
-            # 单个样本softmax的熵值
-            entropy = torch.sum((-ema_softmax*torch.log(ema_softmax)), dim=1, keepdim=True)
-            bf = torch.exp(-entropy)
-            ema_softmax = ema_softmax * bf + w * (1 - bf)
-        else:
-            # ProDA的不同点是在这里给ema_softmax乘上了一个权重w，然后再做argmax产生硬伪标签
-            ema_softmax = ema_softmax * w
+        if not self.fix_label:
+            # 计算w
+            distances = torch.cdist(features, self.prototypes, p=2)
+            # 文中公式没写，开源代码里写了还要减去最小距离
+            nearest_distance, _ = distances.min(dim=1, keepdim=True)
+            distances = distances - nearest_distance
+            w = F.softmax(-distances, dim=1)
+            ema_softmax = ema_softmax * w            
         
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
 
