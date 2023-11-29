@@ -596,7 +596,7 @@ if __name__ == '__main__':
     parser.add_argument('--contrastive', action='store_true')
     # 是否使用域对抗损失
     parser.add_argument('--domain_adv', action='store_true')
-    # 是否使用bf修正
+    # 是否使用修正
     parser.add_argument('--fix_label', action='store_true')
 
 
