@@ -235,7 +235,7 @@ def main(args: argparse.Namespace):
                                   alpha=args.alpha, 
                                   pseudo_label_weight=args.pseudo_label_weight,
                                   threshold=args.pseudo_threshold,
-                                  fix_label=args.fix_label
+                                  denoising=args.denoising
                                   ).to(device)
     init_teacher(teacher, train_target_loader, device)
 
@@ -689,7 +689,7 @@ if __name__ == '__main__':
     # 是否使用域对抗损失
     parser.add_argument('--domain_adv', action='store_true')
     # 是否使用修正
-    parser.add_argument('--fix_label', action='store_true')
+    parser.add_argument('--denoising', action='store_true')
     # 是否使用sce
     parser.add_argument('--sce', action='store_true')
     # 是否使用mcc

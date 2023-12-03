@@ -76,7 +76,7 @@ class EMATeacher(nn.Module):
     
 class EMATeacherPrototype(nn.Module):
 
-    def __init__(self, model, alpha, pseudo_label_weight, threshold, fix_label=False):
+    def __init__(self, model, alpha, pseudo_label_weight, threshold, denoising=False):
         super(EMATeacherPrototype, self).__init__()
         self.ema_model = deepcopy(model)
         # 按照ProDA论文，softmax软标签是固定的
@@ -96,7 +96,7 @@ class EMATeacherPrototype(nn.Module):
             requires_grad=False
         )
         self.momentum = alpha
-        self.fix_label = fix_label
+        self.denoising = denoising
 
         self.init_mode = False
         self.len_dataset = 0
@@ -150,19 +150,20 @@ class EMATeacherPrototype(nn.Module):
             if isinstance(m, _BatchNorm):
                 m.eval()
 
-        _, features = self.ema_model(target_img)
-        logits, _ = self.ema_model_fix(target_img)
-        # logits, features = self.ema_model(target_img)
-        ema_softmax = torch.softmax(logits.detach(), dim=1)
-
-        if not self.fix_label:
+        if self.denoising:
+            _, features = self.ema_model(target_img)
+            logits, _ = self.ema_model_fix(target_img)
             # 计算w
             distances = torch.cdist(features, self.prototypes, p=2)
             # 文中公式没写，开源代码里写了还要减去最小距离
             nearest_distance, _ = distances.min(dim=1, keepdim=True)
             distances = distances - nearest_distance
             w = F.softmax(-distances, dim=1)
-            ema_softmax = ema_softmax * w            
+            ema_softmax = ema_softmax * w
+        else:
+            logits, features = self.ema_model(target_img)
+
+        ema_softmax = torch.softmax(logits.detach(), dim=1)
         
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
 
