@@ -153,6 +153,7 @@ class EMATeacherPrototype(nn.Module):
         if self.denoising:
             _, features = self.ema_model(target_img)
             logits, _ = self.ema_model_fix(target_img)
+            ema_softmax = torch.softmax(logits.detach(), dim=1)
             # 计算w
             distances = torch.cdist(features, self.prototypes, p=2)
             # 文中公式没写，开源代码里写了还要减去最小距离
@@ -162,8 +163,7 @@ class EMATeacherPrototype(nn.Module):
             ema_softmax = ema_softmax * w
         else:
             logits, features = self.ema_model(target_img)
-
-        ema_softmax = torch.softmax(logits.detach(), dim=1)
+            ema_softmax = torch.softmax(logits.detach(), dim=1)
         
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
 

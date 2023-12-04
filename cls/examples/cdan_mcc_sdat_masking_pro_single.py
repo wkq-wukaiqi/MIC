@@ -474,7 +474,8 @@ def train(scaler, train_source_iter: ForeverDataIterator, train_target_iter: For
         scaler.update()
 
         # 更新原型，按照论文代码，使用的是teacher的输出
-        teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
+        if args.denoising:
+            teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
 
         lr_scheduler.step()
         if args.domain_adv:

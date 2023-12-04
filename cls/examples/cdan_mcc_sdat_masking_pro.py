@@ -568,7 +568,7 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
         if args.domain_adv:
             lr_scheduler_ad.step()
 
-        if not args.fix_label:
+        if args.denoising:
             # 更新原型，按照论文代码，使用的是teacher的输出
             teacher.update_prototypes(features_teacher.detach(), pseudo_prob_t, pseudo_label_t)
 
