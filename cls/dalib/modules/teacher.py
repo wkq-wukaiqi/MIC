@@ -162,7 +162,10 @@ class EMATeacherPrototype(nn.Module):
             w = F.softmax(-distances, dim=1)
             ema_softmax = ema_softmax * w
         else:
-            logits, features = self.ema_model(target_img)
+            # logits, features = self.ema_model(target_img)
+            # ema_softmax = torch.softmax(logits.detach(), dim=1)
+            _, features = self.ema_model(target_img)
+            logits, _ = self.ema_model_fix(target_img)
             ema_softmax = torch.softmax(logits.detach(), dim=1)
         
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
@@ -174,6 +177,7 @@ class EMATeacherPrototype(nn.Module):
 
     def init_end(self):
         self.init_mode = False
+        print(self.confidence_count)
         for i in range(self.num_classes):
             self.prototypes[i] = self.prototypes[i] / self.confidence_count[i]
         self.confidence_count = [0 for _ in range(self.num_classes)]
