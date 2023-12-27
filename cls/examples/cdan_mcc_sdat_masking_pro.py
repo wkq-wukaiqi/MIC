@@ -35,26 +35,117 @@ from common.utils.sam import SAM
 sys.path.append('.')
 import utils
 
-class SCELoss(nn.Module):
-    def __init__(self, num_classes=10, a=1, b=1):
-        super(SCELoss, self).__init__()
-        self.num_classes = num_classes
-        self.a = a #两个超参数
-        self.b = b
-        self.cross_entropy = nn.CrossEntropyLoss()
+def normalize(x, axis=-1):
+    """Normalizing to unit length along the specified dimension.
+    Args:
+      x: pytorch Variable
+    Returns:
+      x: pytorch Variable, same shape as input
+    """
+    x = 1. * x / (torch.norm(x, 2, axis, keepdim=True).expand_as(x) + 1e-12)
+    return x
 
-    def forward(self, pred, labels):
-        # CE 部分，正常的交叉熵损失
-        ce = self.cross_entropy(pred, labels)
 
-        # RCE
-        pred = F.softmax(pred, dim=1)
-        pred = torch.clamp(pred, min=1e-7, max=1.0)
-        label_one_hot = F.one_hot(labels, self.num_classes).float().to(pred.device)
-        label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0) #最小设为 1e-4，即 A 取 -4
-        rce = (-1 * torch.sum(pred * torch.log(label_one_hot), dim=1))
+def euclidean_dist(x, y):
+    """
+    Args:
+      x: pytorch Variable, with shape [m, d]
+      y: pytorch Variable, with shape [n, d]
+    Returns:
+      dist: pytorch Variable, with shape [m, n]
+    """
+    x=x.float()
+    y=y.float()
+    m, n = x.size(0), y.size(0)
+    xx = torch.pow(x, 2).sum(1, keepdim=True).expand(m, n)
+    yy = torch.pow(y, 2).sum(1, keepdim=True).expand(n, m).t()
+    dist = xx + yy
+    dist.addmm_(x, y.t(), beta=1, alpha=-2)
+    dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
+    return dist
 
-        loss = self.a * ce + self.b * rce.mean()
+def hard_example_mining(dist_mat, labels, return_inds=False):
+    """For each anchor, find the hardest positive and negative sample.
+    Args:
+      dist_mat: pytorch Variable, pair wise distance between samples, shape [N, N]
+      labels: pytorch LongTensor, with shape [N]
+      return_inds: whether to return the indices. Save time if `False`(?)
+    Returns:
+      dist_ap: pytorch Variable, distance(anchor, positive); shape [N]
+      dist_an: pytorch Variable, distance(anchor, negative); shape [N]
+      p_inds: pytorch LongTensor, with shape [N];
+        indices of selected hard positive samples; 0 <= p_inds[i] <= N - 1
+      n_inds: pytorch LongTensor, with shape [N];
+        indices of selected hard negative samples; 0 <= n_inds[i] <= N - 1
+    NOTE: Only consider the case in which all labels have same num of samples,
+      thus we can cope with all anchors in parallel.
+    """
+
+    assert len(dist_mat.size()) == 2
+    assert dist_mat.size(0) == dist_mat.size(1)
+    N = dist_mat.size(0)
+
+    # shape [N, N]
+    is_pos = labels.expand(N, N).eq(labels.expand(N, N).t())
+    is_neg = labels.expand(N, N).ne(labels.expand(N, N).t())
+
+    # `dist_ap` means distance(anchor, positive)
+    # both `dist_ap` and `relative_p_inds` with shape [N, 1]
+    dist_ap, relative_p_inds = torch.max(
+        (dist_mat * is_pos.float()).contiguous().view(N, -1), 1, keepdim=True)
+    # `dist_an` means distance(anchor, negative)
+    # both `dist_an` and `relative_n_inds` with shape [N, 1]
+    temp = dist_mat * is_neg.float()
+    temp[temp == 0] = 10e5
+    dist_an, relative_n_inds = torch.min(
+        (temp).contiguous().view(N, -1), 1, keepdim=True)
+    # shape [N]
+    dist_ap = dist_ap.squeeze(1)
+    dist_an = dist_an.squeeze(1)
+
+    if return_inds:
+        # shape [N, N]
+        ind = (labels.new().resize_as_(labels)
+               .copy_(torch.arange(0, N).long())
+               .unsqueeze(0).expand(N, N))
+        # shape [N, 1]
+        p_inds = torch.gather(
+            ind[is_pos].contiguous().view(N, -1), 1, relative_p_inds.data)
+        n_inds = torch.gather(
+            ind[is_neg].contiguous().view(N, -1), 1, relative_n_inds.data)
+        # shape [N]
+        p_inds = p_inds.squeeze(1)
+        n_inds = n_inds.squeeze(1)
+        return dist_ap, dist_an, p_inds, n_inds
+
+    return dist_ap, dist_an
+
+class TripletLoss(object):
+    """Modified from Tong Xiao's open-reid (https://github.com/Cysu/open-reid).
+    Related Triplet Loss theory can be found in paper 'In Defense of the Triplet
+    Loss for Person Re-Identification'."""
+
+    def __init__(self, margin=None):
+        self.margin = margin
+        if margin is not None:
+            self.ranking_loss = nn.MarginRankingLoss(margin=margin)
+        else:
+            self.ranking_loss = nn.SoftMarginLoss()
+
+    def __call__(self, feat, labels, normalize_feature=False):
+        if normalize_feature:
+            feat = normalize(feat, axis=-1)
+        if len(feat.size()) == 3:
+            raise NotImplementedError
+        else:
+            dist_mat = euclidean_dist(feat, feat)
+        dist_ap, dist_an = hard_example_mining(
+            dist_mat, labels)
+        y = dist_an.new().resize_as_(dist_an).fill_(1)
+        if self.margin is not None:
+            loss = self.ranking_loss(dist_an, dist_ap, y)
+        else:
+            loss = self.ranking_loss(dist_an - dist_ap, y)
         return loss
 
 class SupConLoss(nn.Module):
@@ -213,7 +304,7 @@ def main(args: argparse.Namespace):
 
     # create model
     print("=> using model '{}'".format(args.arch))
-    backbone = utils.get_model(args.arch, pretrain=not args.scratch)
+    backbone = utils.get_model(args.arch, pretrain=args.resume_path is None)
     # print(backbone)
     pool_layer = nn.Identity() if args.no_pool else None
     classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim,
@@ -256,11 +347,11 @@ def main(args: argparse.Namespace):
         randomized_dim=args.randomized_dim
     ).to(device)
 
-    mcc_loss = MinimumClassConfusionLoss(temperature=args.temperature)
-
     contrastive_loss = SupConLoss(contrast_mode='one')
 
-    sce_loss = SCELoss(num_classes=num_classes, a=0.1, b=1.)
+    mcc_loss = MinimumClassConfusionLoss(temperature=args.temperature)
+
+    triplet_loss = TripletLoss(margin=0.3)
     
     masking_t = Masking(
         block_size=args.mask_block_size,
@@ -312,7 +403,7 @@ def main(args: argparse.Namespace):
 
         # train for one epoch
         train(first_step_scaler, second_step_scaler, train_source_iter, train_target_iter, classifier, teacher,
-              domain_adv, mcc_loss, contrastive_loss, sce_loss, masking_t, masking_s, optimizer, ad_optimizer, lr_scheduler, lr_scheduler_ad, epoch, args)
+              domain_adv, contrastive_loss, triplet_loss, mcc_loss, masking_t, masking_s, optimizer, ad_optimizer, lr_scheduler, lr_scheduler_ad, epoch, args)
         
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
@@ -360,8 +451,8 @@ def init_teacher(teacher, train_target_loader, device):
 
 
 def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
-          model: ImageClassifier, teacher: EMATeacherPrototype, domain_adv: ConditionalDomainAdversarialLoss, mcc, contrastive_loss,
-          sce_loss,
+          model: ImageClassifier, teacher: EMATeacherPrototype, domain_adv: ConditionalDomainAdversarialLoss, contrastive_loss,
+          triplet_loss, mcc,
           masking_t, masking_s, optimizer, ad_optimizer, lr_scheduler: LambdaLR, lr_scheduler_ad,
           epoch: int, args: argparse.Namespace):
     batch_time = AverageMeter('Time', ':3.1f')
@@ -387,6 +478,9 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
     if args.domain_adv:
         domain_accs = AverageMeter('Domain Acc', ':3.1f')
         log_list.append(domain_accs)
+    if args.triplet:
+        triplet_losses = AverageMeter('Triplet Loss', ':3.3f')
+        log_list.append(triplet_losses)
 
     progress = ProgressMeter(
         args.iters_per_epoch,
@@ -438,33 +532,36 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             y_t_masked, f_t_masked = model(x_t_masked)
 
             # mask一致性损失
-            if args.sce:
-                masking_loss_value = sce_loss(y_t_masked, pseudo_label_t)
+            if teacher.pseudo_label_weight is not None:
+                ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
+                masking_loss_value = torch.mean(pseudo_prob_t* ce)
             else:
-                if teacher.pseudo_label_weight is not None:
-                    ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
-                    masking_loss_value = torch.mean(pseudo_prob_t* ce)
-                else:
-                    masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+                masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
 
             loss = cls_loss + masking_loss_value
 
-            if args.kd_loss:
-                # 一致性KL散度损失
-                teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
-                student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
-                kd_loss = 10*F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
-                loss = loss + kd_loss
+            # if args.kd_loss:
+            #     # 一致性KL散度损失
+            #     teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
+            #     student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
+            #     kd_loss = 10*F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
+            #     loss = loss + kd_loss
+
+            # if args.contrastive:
+            #     # 对比损失
+            #     features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
+            #     contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
+            #     loss = loss + contrastive_loss_value
 
             if args.mcc:
                 mcc_loss_value = mcc(y_t)
                 loss = loss + mcc_loss_value
 
-            if args.contrastive:
-                # 对比损失
-                features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
-                contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
-                loss = loss + contrastive_loss_value
+            # if args.triplet:
+            #     # 三元损失
+            #     triplet_loss_value = triplet_loss(f_s, labels_s)
+
+            #     loss = loss + triplet_loss_value
 
         first_step_scaler.scale(loss).backward()
         first_step_scaler.unscale_(optimizer)
@@ -497,14 +594,11 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             y_t_masked, f_t_masked = model(x_t_masked)
 
             # mask一致性损失
-            if args.sce:
-                masking_loss_value = sce_loss(y_t_masked, pseudo_label_t)
+            if teacher.pseudo_label_weight is not None:
+                ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
+                masking_loss_value = torch.mean(pseudo_prob_t* ce)
             else:
-                if teacher.pseudo_label_weight is not None:
-                    ce = F.cross_entropy(y_t_masked, pseudo_label_t, reduction='none')
-                    masking_loss_value = torch.mean(pseudo_prob_t* ce)
-                else:
-                    masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
+                masking_loss_value = F.cross_entropy(y_t_masked, pseudo_label_t)
 
             loss = cls_loss + masking_loss_value
 
@@ -515,15 +609,20 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
                 kd_loss = 10*F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
                 loss = loss + kd_loss
 
-            if args.mcc:
-                mcc_loss_value = mcc(y_t)
-                loss = loss + mcc_loss_value
-
             if args.contrastive:
                 # 对比损失
                 features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
                 contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
                 loss = loss + contrastive_loss_value
+
+            if args.mcc:
+                mcc_loss_value = mcc(y_t)
+                loss = loss + mcc_loss_value
+
+            if args.triplet:
+                # 三元损失
+                triplet_loss_value = triplet_loss(f_s, labels_s)
+                loss = loss + triplet_loss_value
 
             if args.domain_adv:
                 # 域对抗损失
@@ -552,6 +651,8 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
             contrastive_losses.update(contrastive_loss_value.item(), x_s.size(0))
         if args.domain_adv:
             domain_accs.update(domain_acc, x_s.size(0))
+        if args.triplet:
+            triplet_losses.update(triplet_loss_value, x_s.size(0))
 
 
         second_step_scaler.scale(loss).backward()
@@ -690,8 +791,8 @@ if __name__ == '__main__':
     parser.add_argument('--domain_adv', action='store_true')
     # 是否使用修正
     parser.add_argument('--denoising', action='store_true')
-    # 是否使用sce
-    parser.add_argument('--sce', action='store_true')
+    # 是否使用三元损失
+    parser.add_argument('--triplet', action='store_true')
     # 是否使用mcc
     parser.add_argument('--mcc', action='store_true')
 
