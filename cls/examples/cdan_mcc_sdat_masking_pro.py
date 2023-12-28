@@ -309,12 +309,13 @@ def main(args: argparse.Namespace):
     pool_layer = nn.Identity() if args.no_pool else None
     classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim,
                                  pool_layer=pool_layer, finetune=not args.scratch).to(device)
-
-    # 加载classifier的baseline模型
-    baseline_dict = torch.load(args.resume_path)
-    classifier.load_state_dict(baseline_dict)
     classifier_feature_dim = classifier.features_dim
 
+    # 加载classifier的baseline模型
+    if args.resume_path is not None:
+        baseline_dict = torch.load(args.resume_path, map_location='cuda:0')
+        classifier.load_state_dict(baseline_dict)
+    
     if args.randomized:
         domain_discri = DomainDiscriminator(
             args.randomized_dim, hidden_size=1024).to(device)
@@ -374,9 +375,10 @@ def main(args: argparse.Namespace):
     else:
         masking_s = None
 
-    print("validate baseline model")
-    acc1 = utils.validate(test_loader, classifier, args, device)
-    print("test_acc1 = {:3.1f}".format(acc1))
+    if args.resume_path is not None:
+        print("validate baseline model")
+        acc1 = utils.validate(test_loader, classifier, args, device)
+        print("test_acc1 = {:3.1f}".format(acc1))
 
     # start training
     best_acc1 = 0.
