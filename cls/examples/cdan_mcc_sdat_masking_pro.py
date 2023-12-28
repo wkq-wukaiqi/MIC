@@ -540,28 +540,28 @@ def train(first_step_scaler, second_step_scaler, train_source_iter: ForeverDataI
 
             loss = cls_loss + masking_loss_value
 
-            # if args.kd_loss:
-            #     # 一致性KL散度损失
-            #     teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
-            #     student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
-            #     kd_loss = 10*F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
-            #     loss = loss + kd_loss
+            if args.kd_loss:
+                # 一致性KL散度损失
+                teacher_distance = torch.cdist(features_teacher, teacher.prototypes.detach(), p=2)
+                student_distance_mask = torch.cdist(f_t_masked, teacher.prototypes.detach(), p=2)
+                kd_loss = 10*F.kl_div(F.log_softmax(-student_distance_mask, dim=1), F.softmax(-teacher_distance.detach(), dim=1))
+                loss = loss + kd_loss
 
-            # if args.contrastive:
-            #     # 对比损失
-            #     features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
-            #     contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
-            #     loss = loss + contrastive_loss_value
+            if args.contrastive:
+                # 对比损失
+                features_all = torch.stack([F.normalize(f_t_masked), F.normalize(features_teacher)], dim=1)
+                contrastive_loss_value = contrastive_loss(features_all, pseudo_label_t)
+                loss = loss + contrastive_loss_value
 
             if args.mcc:
                 mcc_loss_value = mcc(y_t)
                 loss = loss + mcc_loss_value
 
-            # if args.triplet:
-            #     # 三元损失
-            #     triplet_loss_value = triplet_loss(f_s, labels_s)
+            if args.triplet:
+                # 三元损失
+                triplet_loss_value = triplet_loss(f_s, labels_s)
 
-            #     loss = loss + triplet_loss_value
+                loss = loss + triplet_loss_value
 
         first_step_scaler.scale(loss).backward()
         first_step_scaler.unscale_(optimizer)
